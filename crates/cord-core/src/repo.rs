@@ -164,6 +164,52 @@ pub fn push(repo_dir: &Path, force: bool) -> Result<String> {
     Ok(new_id)
 }
 
+/// `cord-git rotate` — revocation primitive. Generate a fresh `write_secret`
+/// and `#state` key, re-register the 30640 with ONLY the new write key (freeing
+/// the old key server-side), and re-push the current state under the new
+/// secrets. Anyone who held the old secrets can no longer push (their write key
+/// is deregistered) nor read new content (new `#state` key); their existing
+/// clone keeps working (forward-only, C7). Retained members are re-provisioned
+/// with the new secrets out-of-band (invite flow — Phase 4-full).
+///
+/// Returns the new 30641 event id.
+pub fn rotate(repo_dir: &Path) -> Result<String> {
+    let community_id = read_pointer(repo_dir)?;
+    let mut ks = Keystore::load(&community_id)?;
+    if !ks.is_write() {
+        bail!("only a write member can rotate/revoke");
+    }
+    let relay_url = ks.relays.first().context("no relay configured")?.clone();
+    let hosting = ks.hosting_keys()?;
+
+    let new_write_secret = crypto::random_32();
+    let new_state_key = crypto::random_32();
+    let new_write_keys = crypto::derive_write_keys(&new_write_secret, ks.epoch)?;
+
+    // Re-register with the new write key only; the server frees the old key's
+    // claim, so a 30641 signed by the old key is rejected thereafter.
+    let reg = events::build_registration(
+        &hosting,
+        &new_write_keys,
+        &ks.alias,
+        &ks.relays,
+        &ks.servers,
+    )?;
+    let out = relay::publish(&relay_url, &reg)?;
+    if !out.accepted {
+        bail!("re-registration (rotation) rejected: {}", out.message);
+    }
+
+    ks.write_secret = Some(hex::encode(new_write_secret));
+    ks.state_key = hex::encode(new_state_key);
+    // The new write key is a fresh (author, alias) coordinate → fresh CAS chain.
+    ks.manifest_prev = None;
+    ks.save()?;
+
+    // Re-push current state under the new secrets (force: fresh chain).
+    push(repo_dir, true)
+}
+
 /// `cord-git clone` — fetch latest 30641, decrypt the manifest + packs, and
 /// materialize the repo at `dest`. Requires a local keystore for `community_id`
 /// (from `create` on this machine or `join` from an invite).

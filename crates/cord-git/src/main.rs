@@ -45,6 +45,12 @@ enum Cmd {
         /// Destination directory.
         dir: PathBuf,
     },
+    /// Rotate repo secrets (revocation primitive): deregister the old write key
+    /// and re-key #state, then re-push. Locks out anyone holding old secrets.
+    Rotate {
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
     /// Show local keystore info for a community.
     Status { community_id: String },
     /// Connectivity + keystore self-check.
@@ -73,6 +79,10 @@ fn main() -> Result<()> {
         Cmd::Clone { community_id, dir } => {
             repo::clone(&community_id, &dir)?;
             println!("cloned {} into {}", community_id, dir.display());
+        }
+        Cmd::Rotate { dir } => {
+            let id = repo::rotate(&dir)?;
+            println!("rotated. old secrets revoked. new state root 30641 id: {id}");
         }
         Cmd::Status { community_id } => {
             let ks = Keystore::load(&community_id).context("load keystore")?;

@@ -167,6 +167,57 @@ else
   fail "push --force"; cat "$WORK/forcepush.log"
 fi
 
+# --- scenario 7: revocation via rotate -------------------------------------
+# A "member" holds a full copy of the owner secrets. The owner rotates; the
+# member (old secrets) must then be unable to push OR read new content.
+MEMBER_HOME="$WORK/member-cfg"
+mkdir -p "$MEMBER_HOME/$CID"
+cp "$OWNER_HOME/$CID/keystore.json" "$MEMBER_HOME/$CID/keystore.json"
+MEMBER_REPO="$WORK/member-repo"
+CORD_GIT_HOME="$MEMBER_HOME" "$CORD_BIN" clone "$CID" "$MEMBER_REPO" >/dev/null 2>&1
+sleep 1.1
+# Owner rotates (revokes old secrets).
+if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" rotate --dir "$REPO" >"$WORK/rotate.log" 2>&1; then
+  pass "owner rotate/revoke succeeded ($(sed -n 's/.*30641 id: //p' "$WORK/rotate.log" | cut -c1-12)…)"
+else
+  fail "owner rotate/revoke"; cat "$WORK/rotate.log"
+fi
+# Owner pushes fresh content under the new secrets.
+sleep 1.1
+echo "post-revocation secret content" >> "$REPO/README.md"
+git -C "$REPO" commit -aq -m "after revocation"
+CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" push --dir "$REPO" >"$WORK/push3.log" 2>&1
+
+# Removed member (old secrets) tries to push → server rejects (write key freed).
+echo "member sneaky change" >> "$MEMBER_REPO/README.md"
+git -C "$MEMBER_REPO" commit -aq -m "member edit" 2>/dev/null
+if CORD_GIT_HOME="$MEMBER_HOME" "$CORD_BIN" push --dir "$MEMBER_REPO" --force >"$WORK/memberpush.log" 2>&1; then
+  fail "revoked member push should have been rejected by the server"
+else
+  if grep -qiE 'registered write key|rejected|restricted' "$WORK/memberpush.log"; then
+    pass "revoked member push rejected server-side"
+  else
+    fail "revoked member push failed for wrong reason"; cat "$WORK/memberpush.log"
+  fi
+fi
+
+# Removed member (old #state key) tries to read the new content → cannot decrypt.
+MEMBER_RECLONE="$WORK/member-reclone"
+if CORD_GIT_HOME="$MEMBER_HOME" "$CORD_BIN" clone "$CID" "$MEMBER_RECLONE" >"$WORK/memberclone.log" 2>&1; then
+  # If it "succeeds", the new content must NOT be present (they only see old).
+  if grep -q "post-revocation" "$MEMBER_RECLONE/README.md" 2>/dev/null; then
+    fail "revoked member could read post-revocation content"
+  else
+    pass "revoked member cannot read post-revocation content (stale view only)"
+  fi
+else
+  if grep -qiE 'aead|decrypt|mismatch|wrong key' "$WORK/memberclone.log"; then
+    pass "revoked member clone fails to decrypt new manifest"
+  else
+    fail "revoked member clone failed for wrong reason"; cat "$WORK/memberclone.log"
+  fi
+fi
+
 echo "==============================="
 if [ "$FAILED" -eq 0 ]; then
   echo "E2E: ALL GREEN"
