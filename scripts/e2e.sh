@@ -29,6 +29,9 @@ fail() { echo "FAIL: $1"; FAILED=1; }
 echo "=== workdir: $WORK ==="
 
 # --- spawn server -----------------------------------------------------------
+# Run from inside the data dir so the server's CWD-relative .relay-owner.nsec
+# lands in the throwaway workdir (cleaned up), never the repo.
+cd "$SRV_DATA" || exit 2
 NGIT_DOMAIN="127.0.0.1:${PORT}" \
 NGIT_BIND_ADDRESS="127.0.0.1:${PORT}" \
 NGIT_DATABASE_BACKEND=memory \
