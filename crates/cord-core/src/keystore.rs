@@ -1,0 +1,152 @@
+//! Per-community keystore on disk under `CORD_GIT_HOME`
+//! (default `~/.config/cord-git`). Holds every client secret for one
+//! community; the server holds none of this. Files are written 0600 and never
+//! logged. See design §5.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+use nostr::Keys;
+use serde::{Deserialize, Serialize};
+
+use crate::crypto;
+
+/// Membership role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Read,
+    Write,
+}
+
+/// The full secret bundle for one community/repo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keystore {
+    pub community_id: String,
+    pub repo_name: String,
+    /// Hosting npub secret (nsec hex) — the pseudonymous tenant identity that
+    /// signs the 30640 registration.
+    pub hosting_nsec: String,
+    /// 32-byte owner salt (hex) feeding the community id.
+    pub owner_salt: String,
+    /// `#state` channel key (hex) — reads manifests.
+    pub state_key: String,
+    /// `#collab` channel key (hex) — reserved for Phase 4.
+    pub collab_key: String,
+    /// `write_secret` (hex) — present only for write-role members; derives the
+    /// registered write keypair. Absent (None) for read-only members.
+    pub write_secret: Option<String>,
+    /// Current epoch (0 in P3).
+    pub epoch: u32,
+    /// Server-side alias (32-hex) under which this repo is registered.
+    pub alias: String,
+    /// Node relay URLs (ws/wss).
+    pub relays: Vec<String>,
+    /// Node blob server base URLs (http/https).
+    pub servers: Vec<String>,
+    /// This member's role.
+    pub role: Role,
+    /// Last observed 30641 event id (CAS anchor); None before first push/fetch.
+    pub manifest_prev: Option<String>,
+}
+
+impl Keystore {
+    /// Root keystore directory (`CORD_GIT_HOME` or `~/.config/cord-git`).
+    pub fn home() -> Result<PathBuf> {
+        if let Ok(dir) = std::env::var("CORD_GIT_HOME") {
+            return Ok(PathBuf::from(dir));
+        }
+        let base = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(base).join(".config").join("cord-git"))
+    }
+
+    fn path_for(community_id: &str) -> Result<PathBuf> {
+        Ok(Self::home()?.join(community_id).join("keystore.json"))
+    }
+
+    /// 32-byte hex secrets → typed arrays.
+    pub fn state_key_bytes(&self) -> Result<[u8; 32]> {
+        hex32(&self.state_key)
+    }
+    pub fn owner_salt_bytes(&self) -> Result<[u8; 32]> {
+        hex32(&self.owner_salt)
+    }
+    pub fn write_secret_bytes(&self) -> Result<Option<[u8; 32]>> {
+        match &self.write_secret {
+            Some(h) => Ok(Some(hex32(h)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn hosting_keys(&self) -> Result<Keys> {
+        Keys::parse(&self.hosting_nsec).map_err(|e| anyhow!("bad hosting nsec: {e}"))
+    }
+
+    /// Derived write keypair (write-role only).
+    pub fn write_keys(&self) -> Result<Keys> {
+        let secret = self
+            .write_secret_bytes()?
+            .ok_or_else(|| anyhow!("this keystore is read-only (no write_secret)"))?;
+        crypto::derive_write_keys(&secret, self.epoch)
+    }
+
+    /// Tenant x-only pubkey hex (the 30640 author).
+    pub fn tenant_hex(&self) -> Result<String> {
+        Ok(self.hosting_keys()?.public_key().to_hex())
+    }
+
+    pub fn is_write(&self) -> bool {
+        self.role == Role::Write && self.write_secret.is_some()
+    }
+
+    /// Persist atomically with 0600 permissions.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path_for(&self.community_id)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(self)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        set_permissions_0600(&tmp)?;
+        std::fs::rename(&tmp, &path)?;
+        set_permissions_0600(&path)?;
+        Ok(())
+    }
+
+    pub fn load(community_id: &str) -> Result<Self> {
+        let path = Self::path_for(community_id)?;
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("no keystore for community {community_id} at {path:?}"))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn exists(community_id: &str) -> bool {
+        Self::path_for(community_id)
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+}
+
+fn hex32(h: &str) -> Result<[u8; 32]> {
+    let v = hex::decode(h).map_err(|_| anyhow!("invalid hex"))?;
+    let arr: [u8; 32] = v
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("expected 32 bytes"))?;
+    Ok(arr)
+}
+
+#[cfg(unix)]
+fn set_permissions_0600(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_permissions_0600(_path: &Path) -> Result<()> {
+    Ok(())
+}

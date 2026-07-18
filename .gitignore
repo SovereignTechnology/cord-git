@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+
+# server-generated relay identity (never commit secrets)
+.relay-owner.nsec
+# client keystores if ever placed here
+.config/
