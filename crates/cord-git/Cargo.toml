@@ -12,3 +12,4 @@ path = "src/main.rs"
 cord-core = { path = "../cord-core" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+nostr = { workspace = true }

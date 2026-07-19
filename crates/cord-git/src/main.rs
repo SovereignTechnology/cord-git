@@ -55,6 +55,19 @@ enum Cmd {
     Status { community_id: String },
     /// Connectivity + keystore self-check.
     Doctor { community_id: String },
+    /// TEST-ONLY (requires CORD_GIT_ALLOW_DEBUG=1): publish a validly-signed
+    /// 30641 with a future created_at — the reader-pinning attack vector.
+    /// Used by e2e.sh to prove clients reject future-dated state roots.
+    #[command(hide = true)]
+    DebugForgeFutureState {
+        community_id: String,
+        /// Seconds into the future to date the event.
+        #[arg(long)]
+        ahead_secs: u64,
+        /// Manifest blob hash (any 64-hex; need not exist).
+        #[arg(long)]
+        m: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -96,6 +109,30 @@ fn main() -> Result<()> {
             println!("base 30641:{:?}", ks.manifest_prev);
         }
         Cmd::Doctor { community_id } => doctor(&community_id)?,
+        Cmd::DebugForgeFutureState {
+            community_id,
+            ahead_secs,
+            m,
+        } => {
+            anyhow::ensure!(
+                std::env::var("CORD_GIT_ALLOW_DEBUG").as_deref() == Ok("1"),
+                "debug commands require CORD_GIT_ALLOW_DEBUG=1"
+            );
+            let ks = Keystore::load(&community_id).context("load keystore")?;
+            let tenant = ks.tenant_hex()?;
+            let wk = ks.write_keys()?;
+            let mut ev = cord_core::events::build_state_root(&wk, &tenant, &ks.alias, &m, 10, &[])?;
+            // Re-sign with a future created_at.
+            let tags = ev.tags.clone();
+            let at = nostr::Timestamp::from_secs(nostr::Timestamp::now().as_secs() + ahead_secs);
+            ev = nostr::prelude::FinalizeEvent::finalize(
+                nostr::EventBuilder::new(nostr::Kind::Custom(30641), "").tags(tags).custom_created_at(at),
+                &wk,
+            )?;
+            let relay = ks.relays.first().context("no relay")?;
+            let out = cord_core::relay::publish(relay, &ev)?;
+            println!("forged future-dated 30641: accepted={} msg={}", out.accepted, out.message);
+        }
     }
     Ok(())
 }
@@ -111,13 +148,14 @@ fn doctor(community_id: &str) -> Result<()> {
         let ok = cord_core::crypto::verify_key_pop(&wk.public_key().to_hex(), &sig, &tenant, &ks.alias);
         println!("write key + proof-of-possession: {}", if ok { "ok" } else { "FAILED" });
     }
-    // Relay reachability: fetch our own registration.
-    if let Some(relay) = ks.relays.first() {
-        match cord_core::relay::latest_state_root(relay, &ks.alias) {
-            Ok(Some(_)) => println!("relay {relay}: ok (state root present)"),
-            Ok(None) => println!("relay {relay}: ok (no state root yet)"),
-            Err(e) => println!("relay {relay}: UNREACHABLE ({e})"),
+    // Relay reachability + authenticated state-root selection.
+    match cord_core::repo::latest_valid_state_root(&ks) {
+        Ok(Some(state)) => {
+            let id = state.id.to_hex();
+            println!("relay + authenticated latest 30641: ok ({})", &id[..12]);
         }
+        Ok(None) => println!("relay: ok (registered, no state root yet)"),
+        Err(e) => println!("relay/auth check: FAILED ({e})"),
     }
     Ok(())
 }

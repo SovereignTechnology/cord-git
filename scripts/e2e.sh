@@ -167,6 +167,39 @@ else
   fail "push --force"; cat "$WORK/forcepush.log"
 fi
 
+# --- scenario 8: future-dated pinning attack --------------------------------
+# A write key (still fully valid, pre-rotation) tries to publish a 30641 dated
+# +2h. The server MUST reject it at admission (15-min future bound): admitted,
+# it would EVICT the real latest 30641 from the relay DB (addressable
+# replacement), a data-availability attack. The client freshness rule is the
+# second layer (operator-injected events), proven in cord-core unit tests.
+STALE_HEAD="$(git -C "$STALE" rev-parse HEAD)"
+FORGE_OUT="$(CORD_GIT_ALLOW_DEBUG=1 CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" debug-forge-future-state "$CID" --ahead-secs 7200 --m "$(printf '0%.0s' $(seq 1 64))" 2>&1)"
+if printf '%s' "$FORGE_OUT" | grep -q 'accepted=false'; then
+  pass "server rejected the +2h forged state root (no eviction of the real latest)"
+else
+  fail "server admitted a +2h forged state root (would evict the real latest)"; echo "$FORGE_OUT"
+fi
+# The real latest (F1) must still be served and cloneable.
+PIN_CLONE="$WORK/pin-clone"
+if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" clone "$CID" "$PIN_CLONE" >"$WORK/pinclone.log" 2>&1; then
+  PIN_HEAD="$(git -C "$PIN_CLONE" rev-parse HEAD 2>/dev/null || echo none)"
+  if [ "$PIN_HEAD" = "$STALE_HEAD" ]; then
+    pass "real latest survived the pinning attempt (clone round-trips)"
+  else
+    fail "latest state root was evicted by the forge (head=$PIN_HEAD expected=$STALE_HEAD)"
+  fi
+else
+  fail "clone failed after pinning attempt"; cat "$WORK/pinclone.log"
+fi
+# And the server-side defense: a +2day forgery is rejected at admission.
+FORGE2_OUT="$(CORD_GIT_ALLOW_DEBUG=1 CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" debug-forge-future-state "$CID" --ahead-secs 200000 --m "$(printf '0%.0s' $(seq 1 64))" 2>&1)"
+if printf '%s' "$FORGE2_OUT" | grep -q 'accepted=false'; then
+  pass "server rejected the +2day forged state root (future bound)"
+else
+  fail "server admitted a +2day forged state root"; echo "$FORGE2_OUT"
+fi
+
 # --- scenario 7: revocation via rotate -------------------------------------
 # A "member" holds a full copy of the owner secrets. The owner rotates; the
 # member (old secrets) must then be unable to push OR read new content.
@@ -176,17 +209,30 @@ cp "$OWNER_HOME/$CID/keystore.json" "$MEMBER_HOME/$CID/keystore.json"
 MEMBER_REPO="$WORK/member-repo"
 CORD_GIT_HOME="$MEMBER_HOME" "$CORD_BIN" clone "$CID" "$MEMBER_REPO" >/dev/null 2>&1
 sleep 1.1
-# Owner rotates (revokes old secrets).
-if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" rotate --dir "$REPO" >"$WORK/rotate.log" 2>&1; then
+# 7a: rotating from a STALE checkout must be REFUSED (freshness guard — the
+# scenario-6 force push moved the remote past the original owner repo).
+if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" rotate --dir "$REPO" >"$WORK/rotate-stale.log" 2>&1; then
+  fail "rotate from a stale checkout should have been refused"
+else
+  if grep -qi "refusing to rotate" "$WORK/rotate-stale.log"; then
+    pass "stale-checkout rotate refused by freshness guard"
+  else
+    fail "stale rotate failed for wrong reason"; cat "$WORK/rotate-stale.log"
+  fi
+fi
+# 7b: re-sync (clone fresh), then rotate from the up-to-date checkout.
+REPO_FRESH="$WORK/owner-fresh"
+CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" clone "$CID" "$REPO_FRESH" >/dev/null 2>&1
+if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" rotate --dir "$REPO_FRESH" >"$WORK/rotate.log" 2>&1; then
   pass "owner rotate/revoke succeeded ($(sed -n 's/.*30641 id: //p' "$WORK/rotate.log" | cut -c1-12)…)"
 else
   fail "owner rotate/revoke"; cat "$WORK/rotate.log"
 fi
 # Owner pushes fresh content under the new secrets.
 sleep 1.1
-echo "post-revocation secret content" >> "$REPO/README.md"
-git -C "$REPO" commit -aq -m "after revocation"
-CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" push --dir "$REPO" >"$WORK/push3.log" 2>&1
+echo "post-revocation secret content" >> "$REPO_FRESH/README.md"
+git -C "$REPO_FRESH" commit -aq -m "after revocation"
+CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" push --dir "$REPO_FRESH" >"$WORK/push3.log" 2>&1
 
 # Removed member (old secrets) tries to push → server rejects (write key freed).
 echo "member sneaky change" >> "$MEMBER_REPO/README.md"

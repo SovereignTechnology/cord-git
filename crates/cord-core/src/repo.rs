@@ -15,6 +15,98 @@ use crate::{blob, git, relay};
 /// community.
 const POINTER_FILE: &str = ".cord-git";
 
+/// Maximum clock-skew tolerance for accepting an event's `created_at` as
+/// "not future-dated". Anything newer is rejected: a future-dated 30641 would
+/// otherwise win the latest-edition sort indefinitely (pin/rollback attack).
+const FUTURE_SLACK_SECS: u64 = 900;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Extract the registered write-key pubkeys (first value of each `w` tag).
+fn parse_w_keys(registration: &nostr::Event) -> Vec<String> {
+    registration
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let v = t.clone().to_vec();
+            if v.len() >= 2 && v[0] == "w" {
+                Some(v[1].clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Is this 30640 the authentic live registration for `tenant_hex`?
+/// Signature-valid, authored by the tenant, not future-dated.
+fn registration_is_valid(reg: &nostr::Event, tenant_hex: &str, now: u64) -> bool {
+    reg.pubkey.to_hex() == tenant_hex
+        && reg.verify().is_ok()
+        && reg.created_at.as_secs() <= now + FUTURE_SLACK_SECS
+}
+
+/// Is this 30641 trustworthy? Signature-valid, authored by a CURRENT registered
+/// write key, not future-dated. This is what makes revocation real: after a
+/// rotation the old write key is out of the w-set, so its events — including
+/// any future-dated ones planted before revocation — are never selected.
+fn state_root_is_valid(ev: &nostr::Event, w_keys: &[String], now: u64) -> bool {
+    ev.verify().is_ok()
+        && w_keys.iter().any(|k| *k == ev.pubkey.to_hex())
+        && ev.created_at.as_secs() <= now + FUTURE_SLACK_SECS
+}
+
+/// Select the newest valid 30641 from raw candidates (created_at desc,
+/// tie → lowest id — mirroring addressable-replacement semantics).
+pub fn select_valid_state_root(
+    mut candidates: Vec<nostr::Event>,
+    w_keys: &[String],
+    now: u64,
+) -> Option<nostr::Event> {
+    candidates.retain(|ev| state_root_is_valid(ev, w_keys, now));
+    candidates.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
+    });
+    candidates.into_iter().next()
+}
+
+/// The current registered write-key set for this keystore's alias, from the
+/// signature-verified live registration.
+fn live_w_keys(ks: &Keystore) -> Result<Vec<String>> {
+    let relay_url = ks.relays.first().context("no relay configured")?;
+    let tenant_hex = ks.tenant_hex()?;
+    let mut regs = relay::registration_candidates(relay_url, &ks.alias)?;
+    let now = now_secs();
+    regs.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
+    });
+    for reg in &regs {
+        if registration_is_valid(reg, &tenant_hex, now) {
+            return Ok(parse_w_keys(reg));
+        }
+    }
+    bail!("no valid live registration (30640) found for this alias")
+}
+
+/// Fetch the newest 30641 that is signature-valid, authored by a current
+/// registered write key, and not future-dated. Every read path (push CAS,
+/// clone, rotate, doctor) MUST use this — never raw relay results.
+pub fn latest_valid_state_root(ks: &Keystore) -> Result<Option<nostr::Event>> {
+    let w_keys = live_w_keys(ks)?;
+    let relay_url = ks.relays.first().context("no relay configured")?;
+    let candidates = relay::state_root_candidates(relay_url, &ks.alias)?;
+    Ok(select_valid_state_root(candidates, &w_keys, now_secs()))
+}
+
 /// Result of a create.
 pub struct Created {
     pub community_id: String,
@@ -94,8 +186,9 @@ pub fn push(repo_dir: &Path, force: bool) -> Result<String> {
     let write_keys = ks.write_keys()?;
     let state_key = ks.state_key_bytes()?;
 
-    // CAS: the remote must be where we left it.
-    let remote = relay::latest_state_root(&relay_url, &ks.alias)?;
+    // CAS: the remote must be where we left it — using the AUTHENTICATED
+    // latest (signature + current-write-key + freshness checked).
+    let remote = latest_valid_state_root(&ks)?;
     let remote_id = remote.as_ref().map(|e| e.id.to_hex());
     if !force && remote_id != ks.manifest_prev {
         bail!(
@@ -158,10 +251,40 @@ pub fn push(repo_dir: &Path, force: bool) -> Result<String> {
         bail!("state root (30641) rejected: {}", out.message);
     }
 
+    // Post-publish confirmation: OK=true does NOT mean our edition won the
+    // (author, alias) coordinate — the relay stores only the newest, and the
+    // policy can accept an edition the DB then discards (stale/lost race).
+    // Read back and verify OUR event is the served latest before claiming
+    // success; otherwise manifest_prev would record a phantom.
+    let confirmed = latest_valid_state_root(&ks)?;
+    let confirmed_id = confirmed.as_ref().map(|e| e.id.to_hex());
     let new_id = state.id.to_hex();
+    if confirmed_id.as_deref() != Some(new_id.as_str()) {
+        bail!(
+            "push lost the race: our 30641 was accepted but is not the served latest \
+             (latest={confirmed_id:?}). Another writer won — re-clone and re-apply your changes."
+        );
+    }
+
     ks.manifest_prev = Some(new_id.clone());
     ks.save()?;
     Ok(new_id)
+}
+
+/// Fetch + decrypt the remote manifest for this keystore (None if the repo
+/// was registered but never pushed).
+fn remote_manifest(ks: &Keystore) -> Result<Option<Manifest>> {
+    let Some(state) = latest_valid_state_root(ks)? else {
+        return Ok(None);
+    };
+    let server_url = ks.servers.first().context("no blob server configured")?;
+    let m_hash = tag_value(&state, "m").ok_or_else(|| anyhow!("30641 missing m tag"))?;
+    let wire = blob::get(server_url, &m_hash)?;
+    if crypto::sha256_hex(&wire) != m_hash {
+        bail!("manifest blob hash mismatch — operator served wrong bytes");
+    }
+    let json = crypto::decrypt_manifest(&ks.state_key_bytes()?, &wire)?;
+    Ok(Some(Manifest::from_json(&json)?))
 }
 
 /// `cord-git rotate` — revocation primitive. Generate a fresh `write_secret`
@@ -181,6 +304,24 @@ pub fn rotate(repo_dir: &Path) -> Result<String> {
     }
     let relay_url = ks.relays.first().context("no relay configured")?.clone();
     let hosting = ks.hosting_keys()?;
+
+    // Freshness guard: refuse to rotate when the LOCAL WORKING TREE's refs
+    // differ from the remote manifest's refs. rotate re-publishes the local
+    // checkout under new secrets, so rotating from a stale checkout would
+    // silently roll back every reader. (Comparing refs, not the keystore
+    // anchor — another clone may have moved the keystore past this checkout.)
+    match remote_manifest(&ks)? {
+        None => {} // never pushed — nothing to be behind
+        Some(m) => {
+            let local_refs = git::branch_refs(repo_dir)?;
+            if m.refs != local_refs {
+                bail!(
+                    "refusing to rotate: this checkout's refs differ from the remote — \
+                     re-clone (or fast-forward) first"
+                );
+            }
+        }
+    }
 
     let new_write_secret = crypto::random_32();
     let new_state_key = crypto::random_32();
@@ -216,13 +357,17 @@ pub fn rotate(repo_dir: &Path) -> Result<String> {
 pub fn clone(community_id: &str, dest: &Path) -> Result<()> {
     let mut ks = Keystore::load(community_id)
         .with_context(|| format!("no keystore for {community_id}; join or create first"))?;
-    let relay_url = ks.relays.first().context("no relay configured")?.clone();
     let server_url = ks.servers.first().context("no blob server configured")?.clone();
     let state_key = ks.state_key_bytes()?;
 
+    // Refuse to clone into a non-empty directory: unpacking into an existing
+    // tree could clobber files or execute pre-existing git hooks.
+    if dest.exists() && dest.read_dir()?.next().is_some() {
+        bail!("destination {dest:?} is not empty — refusing to clone into it");
+    }
     git::init(dest)?;
 
-    let Some(state) = relay::latest_state_root(&relay_url, &ks.alias)? else {
+    let Some(state) = latest_valid_state_root(&ks)? else {
         // Empty repo (registered but never pushed).
         write_pointer(dest, community_id)?;
         return Ok(());
@@ -333,4 +478,118 @@ fn hex32(h: &str) -> Result<[u8; 32]> {
 /// Verify JSON round-trips (used by `doctor`, cheap self-check).
 pub fn event_json_ok(event: &nostr::Event) -> bool {
     nostr::Event::from_json(event.as_json()).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::build_registration;
+    use nostr::prelude::FinalizeEvent;
+    use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+    fn reg_for(tenant: &Keys, w: &Keys, alias: &str) -> nostr::Event {
+        build_registration(
+            tenant,
+            w,
+            alias,
+            &["ws://127.0.0.1:1".into()],
+            &["http://127.0.0.1:1".into()],
+        )
+        .unwrap()
+    }
+
+    /// A kind-30641 signed by `signer` at a chosen created_at (d tag only —
+    /// selection logic only inspects author/signature/created_at).
+    fn sr_raw(signer: &Keys, alias: &str, at: u64) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(30641), "")
+            .tags(vec![Tag::identifier(alias.to_string())])
+            .custom_created_at(Timestamp::from_secs(at))
+            .finalize(signer)
+            .unwrap()
+    }
+
+    #[test]
+    fn forged_signature_is_excluded() {
+        let now = now_secs();
+        let w = Keys::generate();
+        let alias = "cd".repeat(16);
+        let good = sr_raw(&w, &alias, now - 10);
+        // Valid signature but from a key that is NOT in the w-set.
+        let attacker = Keys::generate();
+        let forged = sr_raw(&attacker, &alias, now - 5); // newer, must still lose
+        let w_keys = vec![w.public_key().to_hex()];
+        let selected = select_valid_state_root(vec![good.clone(), forged], &w_keys, now).unwrap();
+        assert_eq!(selected.id, good.id);
+    }
+
+    #[test]
+    fn future_dated_by_registered_key_is_excluded() {
+        let now = now_secs();
+        let w = Keys::generate();
+        let alias = "cd".repeat(16);
+        let good = sr_raw(&w, &alias, now - 10);
+        // Same author (the real write key), but future-dated — the pinning attack.
+        let pinned = sr_raw(&w, &alias, now + 100 * 365 * 24 * 3600);
+        let w_keys = vec![w.public_key().to_hex()];
+        let selected = select_valid_state_root(vec![good.clone(), pinned], &w_keys, now).unwrap();
+        assert_eq!(selected.id, good.id);
+        // Slight future within slack is fine.
+        let ok = sr_raw(&w, &alias, now + 60);
+        let selected = select_valid_state_root(vec![ok.clone()], &w_keys, now).unwrap();
+        assert_eq!(selected.id, ok.id);
+    }
+
+    #[test]
+    fn rotation_locks_out_old_key_events() {
+        let now = now_secs();
+        let old_w = Keys::generate();
+        let new_w = Keys::generate();
+        let alias = "cd".repeat(16);
+        // Old key published (even recently); rotation lists only new_w.
+        let old_state = sr_raw(&old_w, &alias, now - 5);
+        let new_state = sr_raw(&new_w, &alias, now - 60); // older than old_state
+        let new_w_keys = vec![new_w.public_key().to_hex()];
+        let selected =
+            select_valid_state_root(vec![old_state, new_state.clone()], &new_w_keys, now).unwrap();
+        // Even though old_state is NEWER, its author is no longer registered.
+        assert_eq!(selected.id, new_state.id);
+    }
+
+    #[test]
+    fn tampered_event_fails_verify() {
+        let now = now_secs();
+        let w = Keys::generate();
+        let alias = "cd".repeat(16);
+        let mut ev = sr_raw(&w, &alias, now - 10);
+        ev.content = "tampered".into(); // breaks the id/signature binding
+        let w_keys = vec![w.public_key().to_hex()];
+        assert!(select_valid_state_root(vec![ev], &w_keys, now).is_none());
+    }
+
+    #[test]
+    fn registration_validity_rules() {
+        let now = now_secs();
+        let tenant = Keys::generate();
+        let w = Keys::generate();
+        let alias = "cd".repeat(16);
+        let reg = reg_for(&tenant, &w, &alias);
+        assert!(registration_is_valid(&reg, &tenant.public_key().to_hex(), now));
+        // Wrong tenant (operator injecting a forged registration).
+        let other = Keys::generate();
+        let forged = reg_for(&other, &w, &alias);
+        assert!(!registration_is_valid(&forged, &tenant.public_key().to_hex(), now));
+        // W keys parse out.
+        let keys = parse_w_keys(&reg);
+        assert_eq!(keys, vec![w.public_key().to_hex()]);
+        // A state root signed by w validates against the parsed set.
+        let state = sr_raw(&w, &alias, now - 1);
+        assert!(state_root_is_valid(&state, &keys, now));
+    }
+
+    #[test]
+    fn community_id_path_validation() {
+        assert!(Keystore::load("../etc/passwd").is_err());
+        assert!(Keystore::load("not-hex").is_err());
+        assert!(Keystore::load(&"AB".repeat(32)).is_err()); // uppercase
+    }
 }

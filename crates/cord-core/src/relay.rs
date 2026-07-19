@@ -12,10 +12,15 @@ use tungstenite::{connect, Message, WebSocket};
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
 fn set_read_timeout(ws: &mut Ws, dur: Duration) {
-    // Phase 3 talks to localhost ws:// (plaintext). wss:// TLS peers get no
-    // read timeout set here (harmless — the 15s deadline loop still bounds it).
-    if let MaybeTlsStream::Plain(s) = ws.get_mut() {
-        let _ = s.set_read_timeout(Some(dur));
+    match ws.get_mut() {
+        MaybeTlsStream::Plain(s) => {
+            let _ = s.set_read_timeout(Some(dur));
+        }
+        MaybeTlsStream::NativeTls(s) => {
+            let _ = s.get_mut().set_read_timeout(Some(dur));
+        }
+        #[allow(unreachable_patterns)]
+        _ => {}
     }
 }
 
@@ -67,8 +72,10 @@ pub fn publish(relay_url: &str, event: &Event) -> Result<PublishOutcome> {
     Err(anyhow!("no OK received for event {target}"))
 }
 
-/// Fetch stored events matching `filter` (a serde_json filter object), reading
-/// until EOSE or timeout.
+/// Fetch stored events matching `filter`, reading until EOSE. **Errors unless
+/// EOSE actually arrives** — a timeout/`CLOSED`/dropped connection must never
+/// be mistaken for a complete result set (an empty/stale set would look like
+/// "repo never pushed" to a cloner).
 pub fn fetch(relay_url: &str, filter: serde_json::Value) -> Result<Vec<Event>> {
     let (mut ws, _resp) = connect(relay_url).map_err(|e| anyhow!("ws connect {relay_url}: {e}"))?;
     set_read_timeout(&mut ws, Duration::from_secs(8));
@@ -78,6 +85,7 @@ pub fn fetch(relay_url: &str, filter: serde_json::Value) -> Result<Vec<Event>> {
         .map_err(|e| anyhow!("ws send: {e}"))?;
 
     let mut out = Vec::new();
+    let mut got_eose = false;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         match ws.read() {
@@ -95,7 +103,25 @@ pub fn fetch(relay_url: &str, filter: serde_json::Value) -> Result<Vec<Event>> {
                         }
                     }
                     Some("EOSE") if val.get(1).and_then(|v| v.as_str()) == Some(sub) => {
+                        got_eose = true;
                         break;
+                    }
+                    Some("CLOSED") if val.get(1).and_then(|v| v.as_str()) == Some(sub) => {
+                        let reason = val
+                            .get(2)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = ws.close(None);
+                        return Err(anyhow!("subscription closed by relay: {reason}"));
+                    }
+                    Some("NOTICE") => {
+                        let note = val
+                            .get(1)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return Err(anyhow!("relay NOTICE: {note}"));
                     }
                     _ => {}
                 }
@@ -105,22 +131,29 @@ pub fn fetch(relay_url: &str, filter: serde_json::Value) -> Result<Vec<Event>> {
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
-            Err(_) => break,
+            Err(e) => {
+                let _ = ws.close(None);
+                return Err(anyhow!("ws read before EOSE: {e}"));
+            }
         }
     }
     let _ = ws.send(Message::Text(serde_json::json!(["CLOSE", sub]).to_string().into()));
     let _ = ws.close(None);
+    if !got_eose {
+        return Err(anyhow!("no EOSE from relay within deadline"));
+    }
     Ok(out)
 }
 
-/// Fetch the latest kind-30641 for an alias (highest created_at, tie → lowest id).
-pub fn latest_state_root(relay_url: &str, alias: &str) -> Result<Option<Event>> {
-    let filter = serde_json::json!({ "kinds": [30641], "#d": [alias], "limit": 32 });
-    let mut events = fetch(relay_url, filter)?;
-    events.sort_by(|a, b| {
-        b.created_at
-            .cmp(&a.created_at)
-            .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
-    });
-    Ok(events.into_iter().next())
+/// All kind-30641 candidates for an alias (raw, unauthenticated — callers MUST
+/// pass them through `repo::select_valid_state_root` before trusting).
+pub fn state_root_candidates(relay_url: &str, alias: &str) -> Result<Vec<Event>> {
+    let filter = serde_json::json!({ "kinds": [30641], "#d": [alias], "limit": 64 });
+    fetch(relay_url, filter)
+}
+
+/// All kind-30640 candidates for an alias (raw, unauthenticated).
+pub fn registration_candidates(relay_url: &str, alias: &str) -> Result<Vec<Event>> {
+    let filter = serde_json::json!({ "kinds": [30640], "#d": [alias], "limit": 8 });
+    fetch(relay_url, filter)
 }

@@ -313,6 +313,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cord-core",
+ "nostr",
 ]
 
 [[package]]
@@ -1558,6 +1559,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.9.5",
  "sha1",
  "thiserror",

@@ -61,6 +61,16 @@ impl Keystore {
     }
 
     fn path_for(community_id: &str) -> Result<PathBuf> {
+        // The id is joined into a filesystem path — it MUST be exactly 64
+        // lowercase hex, or a hostile `.cord-git` pointer could traverse
+        // outside the keystore root.
+        if community_id.len() != 64
+            || !community_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(anyhow!("invalid community id (expected 64 lowercase hex)"));
+        }
         Ok(Self::home()?.join(community_id).join("keystore.json"))
     }
 
@@ -99,16 +109,17 @@ impl Keystore {
         self.role == Role::Write && self.write_secret.is_some()
     }
 
-    /// Persist atomically with 0600 permissions.
+    /// Persist atomically with 0600 permissions (created restrictive from the
+    /// start — never a world-readable window).
     pub fn save(&self) -> Result<()> {
         let path = Self::path_for(&self.community_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            set_dir_permissions_0700(parent)?;
         }
         let json = serde_json::to_vec_pretty(self)?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        set_permissions_0600(&tmp)?;
+        write_0600(&tmp, &json)?;
         std::fs::rename(&tmp, &path)?;
         set_permissions_0600(&path)?;
         Ok(())
@@ -146,7 +157,47 @@ fn set_permissions_0600(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_dir_permissions_0700(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // Only tighten a dir we just created (skip if it already held keystores
+    // for other communities — tightening is harmless either way, but don't
+    // error on pre-existing).
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn set_permissions_0600(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions_0700(_path: &Path) -> Result<()> {
     Ok(())
 }
