@@ -72,6 +72,11 @@ pub fn publish(relay_url: &str, event: &Event) -> Result<PublishOutcome> {
     Err(anyhow!("no OK received for event {target}"))
 }
 
+/// Hard cap on pagination pages per query — bounds the damage a malicious
+/// relay (infinite junk) or a flooded address can do to one fetch. 128 pages
+/// × 512 events = 65k events per author, far beyond any legitimate stream.
+const MAX_PAGES: u32 = 128;
+
 /// Fetch stored events matching `filter`, reading until EOSE. **Errors unless
 /// EOSE actually arrives** — a timeout/`CLOSED`/dropped connection must never
 /// be mistaken for a complete result set (an empty/stale set would look like
@@ -156,4 +161,142 @@ pub fn state_root_candidates(relay_url: &str, alias: &str) -> Result<Vec<Event>>
 pub fn registration_candidates(relay_url: &str, alias: &str) -> Result<Vec<Event>> {
     let filter = serde_json::json!({ "kinds": [30640], "#d": [alias], "limit": 8 });
     fetch(relay_url, filter)
+}
+
+/// Kind-1059 gift wraps addressed to `recipient_hex` (raw, unauthenticated —
+/// callers MUST `verify()` each event and treat contents as hostile until
+/// unwrapped successfully). Used against the invitee's inbox relay.
+/// Until-paginated: a flooded recipient address cannot push genuine wraps out
+/// of the result window.
+pub fn giftwraps_for(relay_url: &str, recipient_hex: &str) -> Result<Vec<Event>> {
+    let filter = serde_json::json!({ "kinds": [1059], "#p": [recipient_hex] });
+    fetch_all(relay_url, filter)
+}
+
+/// Kind-1059 wraps authored by a given outer key (a derived stream/rekey
+/// address key). Raw, unauthenticated — callers MUST verify + parse.
+/// Until-paginated (GitLab !13): rekey addresses are admitted during rotation
+/// windows and ANY member can flood them with now-dated junk; genuine rekeys
+/// are past-tweaked (up to 2 days back), so a fixed newest-first limit window
+/// would let an attacker push the genuine wrap out of the result set. We
+/// paginate backwards until the relay reports exhaustion; callers skip
+/// unparseable wraps, so junk only costs bandwidth (bounded by the tenant's
+/// storage quota on the server side).
+pub fn wraps_by_author(relay_url: &str, author_hex: &str) -> Result<Vec<Event>> {
+    let filter = serde_json::json!({ "kinds": [1059], "authors": [author_hex] });
+    fetch_all(relay_url, filter)
+}
+
+/// Fetch one event by id (pinpoint — cannot be flooded out of a limit
+/// window). Used for post-publish read-back confirmations, where OK=true is
+/// not a commit marker and a flooded author address must not be able to hide
+/// the wrap we just published (GitLab !13).
+pub fn event_by_id(relay_url: &str, id_hex: &str) -> Result<Vec<Event>> {
+    let filter = serde_json::json!({ "ids": [id_hex], "limit": 1 });
+    fetch(relay_url, filter)
+}
+
+/// Fetch ALL events matching `filter` from every relay in `relay_urls`,
+/// unioned and deduped by id. A withholding relay must not be able to hide
+/// rekeys/registrations from a member who has another node configured
+/// (GitLab !12/!13): any single answering relay suffices. Errors only when
+/// EVERY relay failed — one dead relay must never brick a fold (verify F3).
+pub fn fetch_all_multi(
+    relay_urls: &[String],
+    filter: serde_json::Value,
+) -> Result<Vec<Event>> {
+    let mut out: Vec<Event> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    let mut any_success = false;
+    for url in relay_urls {
+        match fetch_all(url, filter.clone()) {
+            Ok(events) => {
+                any_success = true;
+                for ev in events {
+                    if seen.insert(ev.id) {
+                        out.push(ev);
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{url}: {e}")),
+        }
+    }
+    if !any_success && !errors.is_empty() {
+        return Err(anyhow!("every relay failed: {}", errors.join("; ")));
+    }
+    Ok(out)
+}
+
+/// Until-paginated fetch: drive `filter` (limit forced to 512/page) backwards
+/// until the relay reports exhaustion, deduping by event id across pages.
+/// Newest-first LIMIT semantics otherwise make any result set with more than
+/// `limit` matching events silently incomplete — an attacker who can write to
+/// the queried address exploits exactly that (GitLab !13).
+///
+/// Same-second floods (verify F1): NIP-01 `until` is INCLUSIVE, so when
+/// ≥512 junk wraps share one crafted `created_at` second, stepping `until`
+/// to the page's oldest timestamp never retreats past the junk. Progress is
+/// therefore measured in NEW EVENT IDS, not timestamps: when a full page
+/// yields zero new ids the whole same-second boundary is exhausted as far as
+/// the relay can tell us, and `until` steps BELOW it. (Any genuine event
+/// sharing that exact second behind ≥512 junk stays unreachable — NIP-01 has
+/// no cursor — but for write/state-affecting rotations the fold-side
+/// cross-check makes that loud; a hidden write-only demote epoch for a
+/// read-only member is silent by design — their secrets are unchanged.)
+fn fetch_all(relay_url: &str, filter: serde_json::Value) -> Result<Vec<Event>> {
+    const PAGE: u64 = 512;
+    let mut filter = filter;
+    filter["limit"] = serde_json::json!(PAGE);
+    let mut out: Vec<Event> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut until: Option<u64> = None;
+    for _ in 0..MAX_PAGES {
+        let mut page_filter = filter.clone();
+        if let Some(u) = until {
+            page_filter["until"] = serde_json::json!(u);
+        }
+        let page = fetch(relay_url, page_filter)?;
+        let page_len = page.len();
+        let mut new_in_page = 0usize;
+        let mut oldest: Option<u64> = None;
+        for ev in page {
+            let at = ev.created_at.as_secs();
+            oldest = Some(oldest.map_or(at, |o: u64| o.min(at)));
+            if seen.insert(ev.id) {
+                out.push(ev);
+                new_in_page += 1;
+            }
+        }
+        // An EMPTY page is the only reliable exhaustion signal: relays may
+        // clamp `limit` (strfry defaults to 500 < our 512), so a short page
+        // does NOT prove exhaustion (verify-round F4 — genuine wraps were
+        // silently truncated on clamping inbox relays).
+        if page_len == 0 {
+            return Ok(out);
+        }
+        if new_in_page == 0 {
+            // Non-empty page, zero new ids: either the relay is looping/
+            // ignoring `until`, or everything at the `until` second has been
+            // seen. Step below the boundary second; both cases then make
+            // progress (or terminate at 0). A genuine loop is caught by
+            // MAX_PAGES.
+            let u = until.unwrap_or_else(|| oldest.unwrap_or(0));
+            if u == 0 {
+                return Ok(out);
+            }
+            until = Some(u - 1);
+            continue;
+        }
+        // Progress: retreat to the oldest timestamp seen (never forward).
+        if let Some(o) = oldest {
+            until = Some(match until {
+                Some(u) => u.min(o),
+                None => o,
+            });
+        }
+    }
+    Err(anyhow!(
+        "pagination did not converge within {MAX_PAGES} pages — relay is serving unbounded junk"
+    ))
 }

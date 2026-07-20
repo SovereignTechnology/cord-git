@@ -18,6 +18,18 @@ const WRITE_AUTH_LABEL: &[u8] = b"cord-git/write-auth/v1";
 const MANIFEST_LABEL: &[u8] = b"cord-git/manifest/v1";
 /// Domain-separation prefix for the self-certifying community id.
 const COMMUNITY_LABEL: &[u8] = b"cord-git/community/v1";
+/// HKDF label for the derived guestbook STREAM keypair (signs the outer 1059
+/// wrap of every guestbook Join — never the member npub). Derived from the
+/// shared `#collab` key so every member computes the same keypair.
+const GUESTBOOK_STREAM_LABEL: &[u8] = b"cord-git/guestbook-stream/v1";
+/// HKDF label for the symmetric guestbook SEAL key (encrypts the Join rumor
+/// so only members can read it).
+const GUESTBOOK_SEAL_LABEL: &[u8] = b"cord-git/guestbook-seal/v1";
+/// HKDF label for the symmetric `#collab` SEAL key (encrypts issue/PR/comment
+/// rumors so only channel members can read them). Distinct from the guestbook
+/// seal so the two sub-streams are domain-separated even though they share the
+/// aux-registered outer stream key.
+const COLLAB_SEAL_LABEL: &[u8] = b"cord-git/collab-seal/v1";
 
 /// 32 fresh random bytes from the OS CSPRNG.
 pub fn random_32() -> [u8; 32] {
@@ -58,6 +70,56 @@ pub fn derive_write_keys(write_secret: &[u8; 32], epoch: u32) -> Result<Keys> {
         info.push(attempt);
     }
     Err(anyhow!("could not derive a valid write key"))
+}
+
+/// Derive the shared guestbook stream keypair from the `#collab` channel key.
+/// Every member derives the same keypair; it signs the OUTER wrap of guestbook
+/// Joins (the member npub never signs anything server-visible). The pubkey is
+/// registered in the 30640 `aux` set so the node admits the wraps.
+pub fn derive_guestbook_keys(collab_key: &[u8; 32]) -> Result<Keys> {
+    let hk = Hkdf::<Sha256>::new(Some(GUESTBOOK_STREAM_LABEL), collab_key);
+    let mut okm = [0u8; 32];
+    let mut info: Vec<u8> = Vec::new();
+    for attempt in 0u8..=255 {
+        hk.expand(&info, &mut okm)
+            .map_err(|_| anyhow!("hkdf expand"))?;
+        if let Ok(sk) = SecretKey::from_slice(&okm) {
+            return Ok(Keys::new(sk));
+        }
+        info.push(attempt);
+    }
+    Err(anyhow!("could not derive a valid guestbook key"))
+}
+
+/// Symmetric AEAD key sealing guestbook rumors (derived from `#collab`).
+pub fn guestbook_seal_key(collab_key: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(GUESTBOOK_SEAL_LABEL), collab_key);
+    let mut out = [0u8; 32];
+    hk.expand(&[], &mut out).expect("hkdf 32 bytes is valid");
+    out
+}
+
+/// Symmetric AEAD key sealing `#collab` issue/PR/comment rumors (derived from
+/// the `#collab` channel key). Rolls with `collab_key` on every refounding, so
+/// a revoked member holding the old key cannot read post-rotation content.
+pub fn collab_seal_key(collab_key: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(COLLAB_SEAL_LABEL), collab_key);
+    let mut out = [0u8; 32];
+    hk.expand(&[], &mut out).expect("hkdf 32 bytes is valid");
+    out
+}
+
+/// Seal `plaintext` under a shared symmetric key with a FRESH random nonce
+/// (wire = nonce(12) || ct||tag — same framing as blobs/manifests).
+pub fn seal_symmetric(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    seal(key, &nonce, plaintext)
+}
+
+/// Open a `seal_symmetric` wire blob.
+pub fn open_symmetric(key: &[u8; 32], wire: &[u8]) -> Result<Vec<u8>> {
+    open(key, wire)
 }
 
 /// Schnorr proof-of-possession for a claimed write/aux key, matching the

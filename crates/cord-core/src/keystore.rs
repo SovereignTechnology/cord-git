@@ -19,16 +19,54 @@ pub enum Role {
     Write,
 }
 
+/// One roster grant recorded by the inviter (owner-rooted; the CORD-git-native
+/// simplification of the Concord Roles/Grants fold). Members receive the
+/// current snapshot inside their invite bundle.
+///
+/// NORMATIVE (plan §2, revoke row): push-role conclusions come ONLY from this
+/// roster fold plus write-scope key possession — the absence of a write-scope
+/// rekey slot means never-had-push or demoted, never "removed from the repo".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterEntry {
+    /// Member identity pubkey (x-only hex).
+    pub npub: String,
+    pub role: Role,
+    pub granted_at: u64,
+}
+
+/// One banlist entry (Concord Banlist vsk4, native simplification). A ban is
+/// what triggers a refounding; it is a distinct, refuse-downgrade record —
+/// never inferred from a missing grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BanEntry {
+    /// Banned identity pubkey (x-only hex).
+    pub npub: String,
+    pub banned_at: u64,
+}
+
 /// The full secret bundle for one community/repo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Keystore {
     pub community_id: String,
     pub repo_name: String,
     /// Hosting npub secret (nsec hex) — the pseudonymous tenant identity that
-    /// signs the 30640 registration.
-    pub hosting_nsec: String,
+    /// signs the 30640 registration. Present ONLY on the owner's keystore;
+    /// invited members never receive it.
+    pub hosting_nsec: Option<String>,
+    /// Tenant x-only pubkey hex (the 30640 author). Members verify
+    /// registrations and state roots against this; owners can also derive it
+    /// from `hosting_nsec`.
+    #[serde(default)]
+    pub tenant_pub: Option<String>,
     /// 32-byte owner salt (hex) feeding the community id.
     pub owner_salt: String,
+    /// Community root secret (hex) — the Concord community_root analog. Feeds
+    /// the rekey-pseudonym address derivation (`group_key`); ROLLED on every
+    /// refounding (revoke). Members receive it in the invite bundle and via
+    /// state-scope rekey slots. Absent only on pre-4a keystores (rotation
+    /// flows refuse to run without it).
+    #[serde(default)]
+    pub community_root: Option<String>,
     /// `#state` channel key (hex) — reads manifests.
     pub state_key: String,
     /// `#collab` channel key (hex) — reserved for Phase 4.
@@ -48,6 +86,14 @@ pub struct Keystore {
     pub role: Role,
     /// Last observed 30641 event id (CAS anchor); None before first push/fetch.
     pub manifest_prev: Option<String>,
+    /// Roster grants known locally (owner: authoritative; member: the snapshot
+    /// delivered in the invite bundle).
+    #[serde(default)]
+    pub roster: Vec<RosterEntry>,
+    /// Banlist known locally (owner: authoritative; member: snapshot from
+    /// state-scope rekey slots).
+    #[serde(default)]
+    pub banned: Vec<BanEntry>,
 }
 
 impl Keystore {
@@ -89,7 +135,47 @@ impl Keystore {
     }
 
     pub fn hosting_keys(&self) -> Result<Keys> {
-        Keys::parse(&self.hosting_nsec).map_err(|e| anyhow!("bad hosting nsec: {e}"))
+        let nsec = self
+            .hosting_nsec
+            .as_ref()
+            .ok_or_else(|| anyhow!("owner-only operation: this keystore has no hosting nsec"))?;
+        Keys::parse(nsec).map_err(|e| anyhow!("bad hosting nsec: {e}"))
+    }
+
+    /// `#collab` channel key bytes.
+    pub fn collab_key_bytes(&self) -> Result<[u8; 32]> {
+        hex32(&self.collab_key)
+    }
+
+    /// Community root secret bytes — required by every rotation/refounding
+    /// flow (rekey-pseudonym address derivation).
+    pub fn community_root_bytes(&self) -> Result<[u8; 32]> {
+        let root = self.community_root.as_ref().ok_or_else(|| {
+            anyhow!(
+                "keystore has no community_root (pre-4a keystore) — \
+                 re-create the repo or ask for a fresh invite"
+            )
+        })?;
+        hex32(root)
+    }
+
+    /// Is this the owner's keystore (holds the hosting nsec)?
+    pub fn is_owner(&self) -> bool {
+        self.hosting_nsec.is_some()
+    }
+
+    /// Directory holding this community's keystore + retained rumor bytes.
+    /// The id is path-validated (64 lowercase hex).
+    pub fn community_dir(community_id: &str) -> Result<PathBuf> {
+        Ok(Self::path_for(community_id)?
+            .parent()
+            .expect("keystore path has a parent")
+            .to_path_buf())
+    }
+
+    /// Derived guestbook stream keypair (shared across members via `#collab`).
+    pub fn guestbook_keys(&self) -> Result<Keys> {
+        crypto::derive_guestbook_keys(&self.collab_key_bytes()?)
     }
 
     /// Derived write keypair (write-role only).
@@ -100,8 +186,14 @@ impl Keystore {
         crypto::derive_write_keys(&secret, self.epoch)
     }
 
-    /// Tenant x-only pubkey hex (the 30640 author).
+    /// Tenant x-only pubkey hex (the 30640 author). Members carry it as
+    /// `tenant_pub`; the owner can also derive it from the hosting nsec.
     pub fn tenant_hex(&self) -> Result<String> {
+        if let Some(tp) = &self.tenant_pub {
+            let pk = nostr::PublicKey::from_hex(tp)
+                .map_err(|e| anyhow!("bad tenant_pub in keystore: {e}"))?;
+            return Ok(pk.to_hex());
+        }
         Ok(self.hosting_keys()?.public_key().to_hex())
     }
 
@@ -158,7 +250,7 @@ fn set_permissions_0600(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -192,7 +284,7 @@ fn set_permissions_0600(_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes)?;
     Ok(())
 }
