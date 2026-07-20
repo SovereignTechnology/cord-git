@@ -6,13 +6,16 @@
 //! behind the same interfaces) — see `docs/grasp-p/phase3-design.md` §0.
 
 pub mod blob;
+pub mod collab;
 pub mod crypto;
 pub mod events;
 pub mod git;
+pub mod invite;
 pub mod keystore;
 pub mod manifest;
+pub mod rekey;
 pub mod relay;
 pub mod repo;
 
-pub use keystore::{Keystore, Role};
+pub use keystore::{BanEntry, Keystore, Role, RosterEntry};
 pub use manifest::{Manifest, PackEntry};

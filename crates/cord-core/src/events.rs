@@ -11,25 +11,46 @@ use crate::crypto;
 use crate::manifest::PackEntry;
 
 /// Build a kind-30640 registration, signed by the hosting (tenant) key, with a
-/// proof-of-possession on the derived write key.
+/// proof-of-possession on the derived write key and on each aux (stream) key.
+/// Aux keys admit 1059 wraps (guestbook/collab) but can never publish state
+/// roots or blobs — the server enforces the role split.
 pub fn build_registration(
     hosting: &Keys,
     write_keys: &Keys,
+    aux_keys: &[&Keys],
+    alias: &str,
+    relays: &[String],
+    servers: &[String],
+) -> Result<nostr::Event> {
+    build_registration_keysets(hosting, &[write_keys], aux_keys, alias, relays, servers)
+}
+
+/// Multi-key registration variant used by the §3.3 rotation sequencing
+/// (30640′ widen lists w = old ∪ new and aux = old ∪ new ∪ rekey addresses;
+/// 30640″ narrow lists the new-only sets). Every listed key carries a PoP.
+pub fn build_registration_keysets(
+    hosting: &Keys,
+    write_keys: &[&Keys],
+    aux_keys: &[&Keys],
     alias: &str,
     relays: &[String],
     servers: &[String],
 ) -> Result<nostr::Event> {
     let tenant_hex = hosting.public_key().to_hex();
-    let pop = crypto::key_pop_sig(write_keys, &tenant_hex, alias);
-    let mut tags = vec![
-        Tag::identifier(alias.to_string()),
-        Tag::custom(
-            "w",
-            vec![write_keys.public_key().to_hex(), pop],
-        ),
-        Tag::custom("relays", relays.to_vec()),
-        Tag::custom("server", servers.to_vec()),
-    ];
+    let mut tags = vec![Tag::identifier(alias.to_string())];
+    for w in write_keys {
+        let pop = crypto::key_pop_sig(w, &tenant_hex, alias);
+        tags.push(Tag::custom("w", vec![w.public_key().to_hex(), pop]));
+    }
+    for aux in aux_keys {
+        let aux_pop = crypto::key_pop_sig(aux, &tenant_hex, alias);
+        tags.push(Tag::custom(
+            "aux",
+            vec![aux.public_key().to_hex(), aux_pop],
+        ));
+    }
+    tags.push(Tag::custom("relays", relays.to_vec()));
+    tags.push(Tag::custom("server", servers.to_vec()));
     tags.shrink_to_fit();
     Ok(EventBuilder::new(Kind::Custom(30640), "")
         .tags(tags)

@@ -1,0 +1,17 @@
+[package]
+name = "inbox-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# TEST INFRASTRUCTURE ONLY: a tiny store-and-replay nostr relay standing in
+# for the invitee's own NIP-65/10050 inbox relay in scripts/e2e.sh. Not part
+# of the product; performs no validation beyond JSON shape.
+
+[[bin]]
+name = "inbox-relay"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { workspace = true }
+tungstenite = { workspace = true }

@@ -799,6 +799,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inbox-relay"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tungstenite",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

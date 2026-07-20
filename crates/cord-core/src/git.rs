@@ -116,3 +116,22 @@ pub fn rev_parse(dir: &Path, refish: &str) -> Result<String> {
     let out = run_git(dir, &["rev-parse", refish], None)?;
     Ok(String::from_utf8_lossy(&out).trim().to_string())
 }
+
+/// Produce one mail-formatted patch per commit in `range` (e.g. `main..feature`
+/// or `HEAD~3..HEAD`), oldest first — the raw material for a `#collab` patch
+/// series (NIP-34 kind-1617). Each element is a standalone `git format-patch`
+/// output for a single commit. Empty ranges yield an empty vec.
+pub fn format_patch_range(dir: &Path, range: &str) -> Result<Vec<String>> {
+    let shas_out = run_git(dir, &["rev-list", "--reverse", range], None)?;
+    let shas: Vec<String> = String::from_utf8_lossy(&shas_out)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut patches = Vec::with_capacity(shas.len());
+    for sha in &shas {
+        let out = run_git(dir, &["format-patch", "-1", "--stdout", sha], None)?;
+        patches.push(String::from_utf8_lossy(&out).to_string());
+    }
+    Ok(patches)
+}
