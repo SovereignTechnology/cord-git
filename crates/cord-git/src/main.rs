@@ -217,7 +217,10 @@ enum Cmd {
     /// (verify-round F-B) — register a FRESH alias whose aux set claims one
     /// next-epoch rekey address (derivable by any member), so the repo's
     /// widen hits "write key already registered". The rotation MUST still
-    /// complete via the squat-tolerant minimal widen.
+    /// complete via the squat-tolerant minimal widen. The squat is BACKDATED:
+    /// post-!11 an honest-created_at squat loses the server's §3.2 merge to
+    /// the live+1 widen (evicted) and no longer wedges anything; only a
+    /// claim-winning (earlier-created_at) squat exercises the fallback.
     #[command(hide = true)]
     DebugSquatRekey {
         community_id: String,
@@ -868,19 +871,31 @@ fn main() -> Result<()> {
             // Any root holder (read-only suffices) derives the rekey address
             // key — this is the F-B squatter. Claim it as aux under a FRESH
             // alias so the repo's widen hits the key-conflict rejection.
+            // BACKDATED: post-!11 the server's §3.2 deterministic merge evicts
+            // any conflicting registration whose created_at is not earlier
+            // than the genuine live+1 widen — an honest-created_at squat now
+            // LOSES and no longer wedges the rotation (which is the point of
+            // !11). To keep exercising the squat-tolerant minimal widen, the
+            // squat must WIN the claim, i.e. be backdated below the widen's
+            // created_at (backdating below the true first edition is the
+            // accepted §3.2 residual).
             let addr = rekey::rekey_address(&root, &community_id, scope, next)?;
             let squatter = nostr::Keys::generate();
             let squat_alias = cord_core::crypto::sha256_hex(
                 &nostr::Keys::generate().public_key().to_bytes(),
             )[..32]
                 .to_string();
-            let reg = cord_core::events::build_registration(
+            let backdated =
+                nostr::Timestamp::from_secs(nostr::Timestamp::now().as_secs() - 86_400);
+            let throwaway = nostr::Keys::generate(); // throwaway write key
+            let reg = cord_core::events::build_registration_keysets_at(
                 &squatter,
-                &nostr::Keys::generate(), // throwaway write key
+                &[&throwaway],
                 &[&addr],
                 &squat_alias,
                 &ks.relays,
                 &ks.servers,
+                backdated,
             )?;
             let out = cord_core::relay::publish(relay, &reg)?;
             println!(
