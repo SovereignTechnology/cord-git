@@ -680,9 +680,11 @@ else
 fi
 
 # 28d: verify-round F-B — a member cross-alias SQUATS the NEXT epoch's
-# state-scope rekey address (registered under their own fresh alias), so
-# every upcoming rotation's widen hits "write key already registered". The
-# rotations MUST still complete via the squat-tolerant minimal widen.
+# state-scope rekey address (registered under their own fresh alias, BACKDATED
+# so it wins the post-!11 §3.2 merge — an honest-created_at squat would now
+# lose to the live+1 widen and be evicted), so every upcoming rotation's widen
+# hits "write key already registered". The rotations MUST still complete via
+# the squat-tolerant minimal widen.
 SQUAT_OUT="$(CORD_GIT_ALLOW_DEBUG=1 CORD_GIT_HOME="$READER_HOME" "$CORD_BIN" debug-squat-rekey "$CID" --scope state 2>&1)"
 echo "$SQUAT_OUT" | sed 's/^/  squat: /'
 if printf '%s' "$SQUAT_OUT" | grep -q 'accepted=true'; then

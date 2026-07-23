@@ -36,6 +36,31 @@ pub fn build_registration_keysets(
     relays: &[String],
     servers: &[String],
 ) -> Result<nostr::Event> {
+    build_registration_keysets_at(
+        hosting,
+        write_keys,
+        aux_keys,
+        alias,
+        relays,
+        servers,
+        Timestamp::now(),
+    )
+}
+
+/// created_at-parameterized variant, for TEST/debug tooling only (the e2e
+/// squatter: post-!11 the server's §3.2 merge evicts any squat whose
+/// created_at is not EARLIER than the live+1 widen, so a squat that should
+/// keep wedging rotations must be backdated to win the claim).
+#[allow(clippy::too_many_arguments)]
+pub fn build_registration_keysets_at(
+    hosting: &Keys,
+    write_keys: &[&Keys],
+    aux_keys: &[&Keys],
+    alias: &str,
+    relays: &[String],
+    servers: &[String],
+    created_at: Timestamp,
+) -> Result<nostr::Event> {
     let tenant_hex = hosting.public_key().to_hex();
     let mut tags = vec![Tag::identifier(alias.to_string())];
     for w in write_keys {
@@ -54,6 +79,7 @@ pub fn build_registration_keysets(
     tags.shrink_to_fit();
     Ok(EventBuilder::new(Kind::Custom(30640), "")
         .tags(tags)
+        .custom_created_at(created_at)
         .finalize(hosting)?)
 }
 
