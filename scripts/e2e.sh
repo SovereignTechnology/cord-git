@@ -18,9 +18,25 @@
 # Exit 0 = all green.
 set -uo pipefail
 
-SERVER_BIN="${SERVER_BIN:-$HOME/ngit-private-impl/ref/ngit-grasp/target/release/ngit-grasp}"
-CORD_BIN="${CORD_BIN:-$HOME/ngit-private-impl/cord-git/target/release/cord-git}"
-INBOX_BIN="${INBOX_BIN:-$HOME/ngit-private-impl/cord-git/target/release/inbox-relay}"
+# Derive the tree layout from this script's own location so the defaults survive
+# the tree being moved or checked out elsewhere. Explicit env vars still win.
+_E2E_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CORD_ROOT="$(cd "$_E2E_SCRIPT_DIR/.." && pwd)"   # .../cord-git
+TREE_ROOT="$(cd "$CORD_ROOT/.." && pwd)"         # tree root holding cord-git/ and ref/
+
+SERVER_BIN="${SERVER_BIN:-$TREE_ROOT/ref/ngit-grasp/target/release/ngit-grasp}"
+CORD_BIN="${CORD_BIN:-$CORD_ROOT/target/release/cord-git}"
+INBOX_BIN="${INBOX_BIN:-$CORD_ROOT/target/release/inbox-relay}"
+
+# Fail fast naming the offender, instead of surfacing later as "server did not start".
+for _bin_var in SERVER_BIN CORD_BIN INBOX_BIN; do
+  if [ ! -x "${!_bin_var}" ]; then
+    echo "FATAL: $_bin_var is not an executable file: ${!_bin_var}" >&2
+    echo "       Build it (cargo build --release) or set $_bin_var explicitly." >&2
+    exit 2
+  fi
+done
+
 PORT="${PORT:-7361}"
 INBOX_PORT="${INBOX_PORT:-7362}"
 RELAY="ws://127.0.0.1:${PORT}"
