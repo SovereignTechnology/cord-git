@@ -27,6 +27,7 @@ use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
+use crate::events::FUTURE_SLACK_SECS;
 use crate::keystore::{Keystore, Role, RosterEntry};
 
 /// Direct invite rumor kind (Concord Direct Invite).
@@ -355,6 +356,12 @@ pub struct JoinInfo {
 /// verification (outer or inner), non-Join rumors, and rumors bound to a
 /// different community (`cgc` mismatch — cross-repo replay).
 pub fn parse_join(ks: &Keystore, wrap: &Event) -> Result<JoinInfo> {
+    parse_join_at(ks, wrap, crate::events::now_secs())
+}
+
+/// [`parse_join`] with an explicit wall clock, so the future-dating bound is
+/// testable without sleeping. `now` is seconds since the Unix epoch.
+pub fn parse_join_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<JoinInfo> {
     wrap.verify()
         .map_err(|e| anyhow!("guestbook wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_WRAP) {
@@ -376,6 +383,13 @@ pub fn parse_join(ks: &Keystore, wrap: &Event) -> Result<JoinInfo> {
         .map_err(|e| anyhow!("inner join rumor has an invalid signature: {e}"))?;
     if inner.kind != Kind::Custom(KIND_JOIN) {
         bail!("sealed rumor is not a guestbook join (kind {})", inner.kind.as_u16());
+    }
+    // Same future-dating bound as #collab rumors and the 30640/30641 editions:
+    // `JoinInfo.at` is a join-order signal, so an unbounded created_at lets a
+    // member forge precedence in the roster. Only the inner rumor is bounded;
+    // the outer wrap is past-tweaked on purpose.
+    if inner.created_at.as_secs() > now.saturating_add(FUTURE_SLACK_SECS) {
+        bail!("join rumor is future-dated beyond {FUTURE_SLACK_SECS}s of slack (rejected)");
     }
     let cgc = inner
         .tags
@@ -526,6 +540,26 @@ mod tests {
         let mut other_cid = ks.clone();
         other_cid.community_id = "cd".repeat(32);
         assert!(parse_join(&other_cid, &outer).is_err());
+
+        // A future-dated join rumor is rejected: `at` is a join-order signal,
+        // so an unbounded created_at forges roster precedence (issue #16).
+        let now = crate::events::now_secs();
+        let rumor = EventBuilder::new(Kind::Custom(KIND_JOIN), "")
+            .tags(vec![Tag::custom("cgc", vec![ks.community_id.clone()])])
+            .custom_created_at(Timestamp::from_secs(now + 10 * 365 * 86_400))
+            .finalize(&member)
+            .unwrap();
+        let seal_key = crypto::guestbook_seal_key(&ks.collab_key_bytes().unwrap());
+        let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
+        let dated = EventBuilder::new(
+            Kind::Custom(KIND_WRAP),
+            base64::engine::general_purpose::STANDARD.encode(sealed),
+        )
+        .custom_created_at(Timestamp::tweaked(0..172_800))
+        .finalize(&ks.guestbook_keys().unwrap())
+        .unwrap();
+        let err = parse_join_at(&ks, &dated, now).unwrap_err().to_string();
+        assert!(err.contains("future-dated"), "unexpected error: {err}");
 
         // An outer wrap signed by the member npub itself is rejected.
         let sealed = outer.content.clone();

@@ -10,6 +10,24 @@ use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 use crate::crypto;
 use crate::manifest::PackEntry;
 
+/// Maximum clock-skew tolerance for accepting an event's `created_at` as
+/// "not future-dated". Anything newer is rejected: a future-dated event would
+/// otherwise win a latest-wins sort indefinitely (pin/rollback attack).
+///
+/// This is the single source of truth for that bound. It guards the
+/// server-visible 30640/30641 editions (`repo.rs`) and, because the same
+/// latest-wins shape exists inside the encrypted channels, the `#collab` and
+/// guestbook-join inner rumors (`collab.rs`, `invite.rs`).
+pub const FUTURE_SLACK_SECS: u64 = 900;
+
+/// Current wall-clock seconds since the Unix epoch (0 if the clock predates it).
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Build a kind-30640 registration, signed by the hosting (tenant) key, with a
 /// proof-of-possession on the derived write key and on each aux (stream) key.
 /// Aux keys admit 1059 wraps (guestbook/collab) but can never publish state

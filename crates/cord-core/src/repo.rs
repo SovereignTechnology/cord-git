@@ -19,17 +19,10 @@ use crate::{blob, git, relay};
 /// community.
 const POINTER_FILE: &str = ".cord-git";
 
-/// Maximum clock-skew tolerance for accepting an event's `created_at` as
-/// "not future-dated". Anything newer is rejected: a future-dated 30641 would
-/// otherwise win the latest-edition sort indefinitely (pin/rollback attack).
-const FUTURE_SLACK_SECS: u64 = 900;
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// The future-dating bound and wall-clock helper live in `events` so the
+// encrypted-channel parsers (`collab`, `invite`) enforce the same bound as the
+// server-visible 30640/30641 editions do here.
+use crate::events::{now_secs, FUTURE_SLACK_SECS};
 
 /// Extract the registered write-key pubkeys (first value of each `w` tag).
 fn parse_w_keys(registration: &nostr::Event) -> Vec<String> {
