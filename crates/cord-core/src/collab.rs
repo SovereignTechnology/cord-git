@@ -40,6 +40,7 @@ use nostr::prelude::FinalizeEvent;
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::crypto;
+use crate::events::FUTURE_SLACK_SECS;
 use crate::keystore::Keystore;
 
 /// NIP-34 issue.
@@ -290,6 +291,12 @@ fn tag_vec(t: &Tag) -> Vec<String> {
 /// binding does not match this community and epoch (cross-repo / cross-epoch
 /// replay).
 pub fn parse_collab(ks: &Keystore, wrap: &Event) -> Result<CollabEvent> {
+    parse_collab_at(ks, wrap, crate::events::now_secs())
+}
+
+/// [`parse_collab`] with an explicit wall clock, so the future-dating bound is
+/// testable without sleeping. `now` is seconds since the Unix epoch.
+pub fn parse_collab_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<CollabEvent> {
     wrap.verify()
         .map_err(|e| anyhow!("collab wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_WRAP) {
@@ -312,6 +319,15 @@ pub fn parse_collab(ks: &Keystore, wrap: &Event) -> Result<CollabEvent> {
     let kind = inner.kind.as_u16();
     if !is_collab_kind(kind) {
         bail!("sealed rumor is not a #collab kind (kind {kind})");
+    }
+    // A future-dated rumor sorts after every honest one forever, so any member
+    // — read-only included, since they hold the #collab key — could otherwise
+    // pin a thread's displayed status permanently (`fold_threads` takes the
+    // largest created_at). Bound it exactly as the 30640/30641 editions are.
+    // Only the INNER rumor is bounded: the outer wrap is deliberately
+    // past-tweaked for metadata privacy.
+    if inner.created_at.as_secs() > now.saturating_add(FUTURE_SLACK_SECS) {
+        bail!("collab rumor is future-dated beyond {FUTURE_SLACK_SECS}s of slack (status-pin rejected)");
     }
 
     // Mandated binding checks (plan §2): a-tag community coordinate + channel +
@@ -443,9 +459,15 @@ pub fn fold_threads(mut events: Vec<CollabEvent>) -> Vec<Thread> {
 /// ever returns messages published since the most recent rekey — history before
 /// a rotation is intentionally unreadable with the current keys.
 pub fn read_all(ks: &Keystore, wraps: &[Event]) -> Vec<CollabEvent> {
+    read_all_at(ks, wraps, crate::events::now_secs())
+}
+
+/// [`read_all`] with an explicit wall clock. The clock is sampled once by the
+/// caller so every wrap in a batch is judged against the same instant.
+pub fn read_all_at(ks: &Keystore, wraps: &[Event], now: u64) -> Vec<CollabEvent> {
     let mut out = Vec::new();
     for w in wraps {
-        if let Ok(ev) = parse_collab(ks, w) {
+        if let Ok(ev) = parse_collab_at(ks, w, now) {
             out.push(ev);
         }
     }
@@ -592,5 +614,83 @@ mod tests {
         assert_eq!(threads[0].root.id, root_id);
         assert_eq!(threads[0].children.len(), 2);
         assert_eq!(threads[0].status_label(), "merged");
+    }
+
+    /// Seal a rumor with an attacker-chosen `created_at`. Mirrors `seal_rumor`
+    /// exactly except for the inner timestamp — this is what a member with the
+    /// `#collab` key can trivially produce.
+    fn seal_rumor_dated(
+        author: &Keys,
+        ks: &Keystore,
+        kind: u16,
+        content: &str,
+        extra: Vec<Tag>,
+        created: u64,
+    ) -> Event {
+        let mut tags = binding_tags(ks).unwrap();
+        tags.extend(extra);
+        let rumor = EventBuilder::new(Kind::Custom(kind), content)
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(created))
+            .finalize(author)
+            .unwrap();
+        let seal_key = crypto::collab_seal_key(&ks.collab_key_bytes().unwrap());
+        let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(sealed);
+        EventBuilder::new(Kind::Custom(KIND_WRAP), content_b64)
+            .custom_created_at(Timestamp::tweaked(0..172_800))
+            .finalize(&ks.guestbook_keys().unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn future_dated_inner_rumor_is_rejected_but_slack_is_allowed() {
+        let ks = owner_keystore();
+        let author = Keys::generate();
+        let now = crate::events::now_secs();
+        let extra = vec![Tag::custom("subject", vec!["s".to_string()])];
+
+        // Inside the slack window: accepted (clock skew must not break members).
+        let ok = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra.clone(), now + FUTURE_SLACK_SECS - 60);
+        assert!(parse_collab_at(&ks, &ok, now).is_ok());
+
+        // Just past the slack window: rejected.
+        let over = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra.clone(), now + FUTURE_SLACK_SECS + 60);
+        assert!(parse_collab_at(&ks, &over, now).is_err());
+
+        // The issue-15/16 attack shape: created_at = now + 10 years.
+        let far = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra, now + 10 * 365 * 86_400);
+        let err = parse_collab_at(&ks, &far, now).unwrap_err().to_string();
+        assert!(err.contains("future-dated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn future_dated_status_cannot_pin_a_thread() {
+        let ks = owner_keystore();
+        let owner = Keys::generate();
+        // A read-only member still holds the #collab key, so they can sign and
+        // seal a status rumor — that is precisely the threat in issue #16.
+        let reader = Keys::generate();
+        let now = crate::events::now_secs();
+
+        let issue = build_issue(&owner, &ks, "still open", "body").unwrap();
+        let root_id = issue.rumor_id.clone();
+        let honest = build_status(&owner, &ks, &root_id, Status::Open, "open").unwrap();
+
+        let e_tag = Tag::custom("e", vec![root_id.clone(), String::new(), String::new(), "root".to_string()]);
+        let forged = seal_rumor_dated(
+            &reader,
+            &ks,
+            KIND_STATUS_CLOSED,
+            "closed",
+            vec![e_tag],
+            now + 10 * 365 * 86_400,
+        );
+
+        let wraps = vec![issue.wrap, honest.wrap, forged];
+        let threads = fold_threads(read_all_at(&ks, &wraps, now));
+        assert_eq!(threads.len(), 1);
+        // Without the bound the forged status sorts last and wins forever.
+        assert_eq!(threads[0].status_label(), "open");
     }
 }
