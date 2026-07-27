@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto;
 use crate::events::FUTURE_SLACK_SECS;
-use crate::keystore::{Keystore, Role, RosterEntry};
+use crate::keystore::{Keystore, PriorCollabKey, Role, RosterEntry, MAX_PRIOR_COLLAB_KEYS};
 
 /// Direct invite rumor kind (Concord Direct Invite).
 pub const KIND_INVITE: u16 = 3313;
@@ -62,6 +62,13 @@ pub struct CordGitExt {
     pub epoch: u32,
     /// Roster snapshot at invite time.
     pub roster: Vec<RosterEntry>,
+    /// Prior `#collab` keys (epoch → key + retirement time) handed over at
+    /// invite time so a NEW member reads pre-refounding history too (GitHub
+    /// parity, GitLab #21). Populated only when the inviter retains history;
+    /// `serde(default)` keeps the bundle wire-compatible with pre-ring
+    /// clients in both directions.
+    #[serde(default)]
+    pub prior_collab_keys: std::collections::BTreeMap<u32, PriorCollabKey>,
 }
 
 /// The kind-3313 invite bundle (rumor content). Top level = the community
@@ -121,6 +128,11 @@ impl InviteBundle {
                 community_root: ks.community_root.clone(),
                 epoch: ks.epoch,
                 roster: ks.roster.clone(),
+                prior_collab_keys: if ks.retain_collab_history {
+                    ks.prior_collab_keys.clone()
+                } else {
+                    Default::default()
+                },
             },
         })
     }
@@ -167,6 +179,21 @@ impl InviteBundle {
                 bail!("read invite carries a write_secret — refusing (role/secret incoherence)")
             }
         }
+        // Prior-key ring (GitLab #21): bounded size, hex discipline, and
+        // every entry must actually be PRIOR to the bundle's epoch (a
+        // "prior" key claiming the current/future epoch is malformed or
+        // hostile).
+        if self.cord_git.prior_collab_keys.len() > MAX_PRIOR_COLLAB_KEYS {
+            bail!("invite carries more prior collab keys than the retention cap");
+        }
+        for (epoch, prior) in &self.cord_git.prior_collab_keys {
+            if !is_hex_exact(&prior.key, 64) {
+                bail!("invalid prior collab key in invite");
+            }
+            if *epoch >= self.cord_git.epoch {
+                bail!("prior collab key epoch {epoch} is not prior to the bundle epoch");
+            }
+        }
         if self.relays.is_empty() || self.cord_git.servers.is_empty() {
             bail!("invite is missing node relay/server coordinates");
         }
@@ -194,6 +221,8 @@ impl InviteBundle {
             manifest_prev: None,
             roster: self.cord_git.roster,
             banned: Vec::new(),
+            prior_collab_keys: self.cord_git.prior_collab_keys,
+            retain_collab_history: true,
         }
     }
 }
@@ -362,19 +391,45 @@ pub fn parse_join(ks: &Keystore, wrap: &Event) -> Result<JoinInfo> {
 /// [`parse_join`] with an explicit wall clock, so the future-dating bound is
 /// testable without sleeping. `now` is seconds since the Unix epoch.
 pub fn parse_join_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<JoinInfo> {
+    parse_join_with_ring(ks, &ks.collab_ring()?, wrap, now)
+}
+
+/// Batch form: verify + open every join in `wraps`, skipping unreadable ones
+/// (best-effort, like `collab::read_all`). The ring's EC derivations happen
+/// once for the whole relay-controlled batch, never per wrap.
+pub fn parse_joins(ks: &Keystore, wraps: &[Event]) -> Vec<JoinInfo> {
+    let Ok(ring) = ks.collab_ring() else {
+        return Vec::new();
+    };
+    let now = crate::events::now_secs();
+    wraps
+        .iter()
+        .filter_map(|w| parse_join_with_ring(ks, &ring, w, now).ok())
+        .collect()
+}
+
+fn parse_join_with_ring(
+    ks: &Keystore,
+    ring: &crate::keystore::CollabRing,
+    wrap: &Event,
+    now: u64,
+) -> Result<JoinInfo> {
     wrap.verify()
         .map_err(|e| anyhow!("guestbook wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_WRAP) {
         bail!("not a 1059 wrap");
     }
-    let gb = ks.guestbook_keys()?;
-    if wrap.pubkey != gb.public_key() {
-        bail!("wrap outer signer is not the derived guestbook stream key");
-    }
+    // Ring match, exactly as parse_collab (GitLab #21): the current #collab
+    // key's derived stream key first, then retained priors — join history
+    // survives refoundings. The matched ring entry selects the seal key too
+    // (stream + seal derive from the same collab key; no cross-epoch mixing).
+    let Some(entry) = ring.match_author(&wrap.pubkey) else {
+        bail!("wrap outer signer is not a derived guestbook stream key (current or retained prior)");
+    };
     let sealed = base64::engine::general_purpose::STANDARD
         .decode(wrap.content.as_bytes())
         .map_err(|_| anyhow!("guestbook wrap content is not base64"))?;
-    let seal_key = crypto::guestbook_seal_key(&ks.collab_key_bytes()?);
+    let seal_key = crypto::guestbook_seal_key(&entry.key);
     let raw = crypto::open_symmetric(&seal_key, &sealed)?;
     let inner = Event::from_json(String::from_utf8_lossy(&raw).as_ref())
         .map_err(|e| anyhow!("sealed guestbook payload is not an event: {e}"))?;
@@ -390,6 +445,17 @@ pub fn parse_join_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<JoinInfo> 
     // the outer wrap is past-tweaked on purpose.
     if inner.created_at.as_secs() > now.saturating_add(FUTURE_SLACK_SECS) {
         bail!("join rumor is future-dated beyond {FUTURE_SLACK_SECS}s of slack (rejected)");
+    }
+    // Retired keys are READ-ONLY history (GitLab #21): a join dated after
+    // the key's retirement is a post-revocation forgery by an old-key
+    // holder (phantom members / forged precedence), not history.
+    if let Some((_, retired_at)) = entry.retired {
+        if inner.created_at.as_secs() > retired_at.saturating_add(FUTURE_SLACK_SECS) {
+            bail!(
+                "join rumor under a retired guestbook key postdates the key's retirement \
+                 (post-revocation injection rejected)"
+            );
+        }
     }
     let cgc = inner
         .tags
@@ -438,6 +504,8 @@ mod tests {
             manifest_prev: None,
             roster: vec![],
             banned: vec![],
+            prior_collab_keys: Default::default(),
+            retain_collab_history: true,
         }
     }
 
@@ -589,6 +657,51 @@ mod tests {
     }
 
     #[test]
+    fn join_history_survives_refounding() {
+        // GitLab #21: guestbook joins published under a PRIOR stream key
+        // must stay parseable for members holding the prior-key ring.
+        let ks0 = owner_keystore();
+        let member = Keys::generate();
+        let (old_join, _raw) = build_join(&member, &ks0).unwrap();
+
+        let mut ks1 = ks0.clone();
+        ks1.adopt_collab_key(hex::encode(crypto::random_32()));
+        ks1.epoch = 1;
+        let info = parse_join(&ks1, &old_join).unwrap();
+        assert_eq!(info.member_pub, member.public_key().to_hex());
+
+        // Without the ring (retention off at the roll) the old join is gone.
+        let mut ks_off = ks0.clone();
+        ks_off.retain_collab_history = false;
+        ks_off.adopt_collab_key(ks1.collab_key.clone());
+        ks_off.epoch = 1;
+        assert!(parse_join(&ks_off, &old_join).is_err());
+
+        // Write cliff (GitLab #21): a join under the RETIRED key dated after
+        // its retirement is a post-revocation forgery, not history.
+        let retired_at = ks1.prior_collab_keys.get(&0).unwrap().retired_at;
+        let later = retired_at + FUTURE_SLACK_SECS + 61;
+        let rumor = EventBuilder::new(Kind::Custom(KIND_JOIN), "")
+            .tags(vec![Tag::custom("cgc", vec![ks0.community_id.clone()])])
+            .custom_created_at(Timestamp::from_secs(later))
+            .finalize(&member)
+            .unwrap();
+        let seal_key = crypto::guestbook_seal_key(&ks0.collab_key_bytes().unwrap());
+        let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
+        let injected = EventBuilder::new(
+            Kind::Custom(KIND_WRAP),
+            base64::engine::general_purpose::STANDARD.encode(sealed),
+        )
+        .custom_created_at(Timestamp::tweaked(0..172_800))
+        .finalize(&ks0.guestbook_keys().unwrap())
+        .unwrap();
+        let err = parse_join_at(&ks1, &injected, later + 86_400)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retirement"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn invite_bundle_carries_community_root() {
         let ks = owner_keystore();
         let b = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
@@ -598,6 +711,52 @@ mod tests {
         // A malformed root is refused at validation.
         let mut bad = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
         bad.cord_git.community_root = Some("zz".repeat(32));
+        assert!(bad.validate().is_err());
+    }
+
+    fn prior(key: &str) -> PriorCollabKey {
+        PriorCollabKey {
+            key: key.to_string(),
+            retired_at: crate::events::now_secs(),
+        }
+    }
+
+    #[test]
+    fn invite_bundle_carries_prior_collab_keys() {
+        let mut ks = owner_keystore();
+        ks.epoch = 2;
+        ks.prior_collab_keys.insert(1, prior(&"aa".repeat(32)));
+        // Retaining owner: the ring rides the bundle into the member keystore.
+        let b = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
+        b.validate().unwrap();
+        let mks = b.clone().into_keystore();
+        assert_eq!(mks.prior_collab_keys, ks.prior_collab_keys);
+        assert!(mks.retain_collab_history);
+
+        // Pre-ring bundle JSON (no field) still parses: empty ring.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        v["cord_git"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prior_collab_keys");
+        let back: InviteBundle = serde_json::from_value(v).unwrap();
+        back.validate().unwrap();
+        assert!(back.cord_git.prior_collab_keys.is_empty());
+
+        // Owner with retention OFF never leaks the ring into invites.
+        ks.retain_collab_history = false;
+        let b = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
+        assert!(b.cord_git.prior_collab_keys.is_empty());
+        ks.retain_collab_history = true;
+
+        // Malformed prior key hex is refused.
+        let mut bad = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
+        bad.cord_git.prior_collab_keys.insert(0, prior(&"zz".repeat(32)));
+        assert!(bad.validate().is_err());
+        // A "prior" entry at/after the bundle epoch is refused.
+        let mut bad = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
+        bad.cord_git.prior_collab_keys.insert(2, prior(&"bb".repeat(32)));
         assert!(bad.validate().is_err());
     }
 

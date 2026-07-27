@@ -10,7 +10,7 @@ use crate::collab::{self, CollabPublish, Status, Thread};
 use crate::crypto;
 use crate::events::{self, BlobOp};
 use crate::invite::{self, InviteBundle, JoinInfo};
-use crate::keystore::{BanEntry, Keystore, Role, RosterEntry};
+use crate::keystore::{BanEntry, Keystore, PriorCollabKey, Role, RosterEntry};
 use crate::manifest::{Manifest, PackEntry};
 use crate::rekey::{self, Scope};
 use crate::{blob, git, relay};
@@ -167,6 +167,8 @@ pub fn create(
         manifest_prev: None,
         roster: Vec::new(),
         banned: Vec::new(),
+        prior_collab_keys: Default::default(),
+        retain_collab_history: true,
     };
 
     // Register with the write key AND the derived guestbook stream key in the
@@ -398,16 +400,15 @@ pub struct RosterView {
 pub fn roster(community_id: &str) -> Result<RosterView> {
     let ks = Keystore::load(community_id)?;
     let relay_url = ks.relays.first().context("no relay configured")?;
-    let gb_hex = ks.guestbook_keys()?.public_key().to_hex();
-    let wraps = relay::wraps_by_author(relay_url, &gb_hex)?;
-    let mut joins = Vec::new();
-    for wrap in &wraps {
-        // parse_join verifies outer + inner signatures, the guestbook author,
-        // and the cgc community binding; non-join guestbook rumors are skipped.
-        if let Ok(info) = invite::parse_join(&ks, wrap) {
-            joins.push(info);
-        }
-    }
+    // Whole author ring (GitLab #21): joins published before a refounding
+    // live under prior derived stream keys and are part of the roster
+    // history exactly like pre-revocation issues.
+    let authors = ks.guestbook_author_ring()?;
+    let wraps = relay::wraps_by_authors(relay_url, &authors)?;
+    // parse_joins verifies outer + inner signatures, the guestbook author
+    // ring, and the cgc community binding; non-join guestbook rumors are
+    // skipped (one ring-derivation pass for the whole batch).
+    let mut joins = invite::parse_joins(&ks, &wraps);
     joins.sort_by_key(|j| j.at);
     joins.dedup_by(|a, b| a.member_pub == b.member_pub);
     Ok(RosterView {
@@ -536,13 +537,14 @@ pub fn pr_status(
 }
 
 /// Fetch, verify, and fold every readable #collab thread for a community.
-/// Readable only back to the most recent rekey (the collab key rolls on
-/// revoke) — see `collab::read_all`. Used by `issue/pr list` and `show`.
+/// The fetch spans the whole stream-key ring (current + retained priors,
+/// GitLab #21) so history survives refoundings — see `collab::read_all` for
+/// the readability boundary. Used by `issue/pr list` and `show`.
 pub fn collab_threads(community_id: &str) -> Result<Vec<Thread>> {
     let ks = Keystore::load(community_id)?;
     let relay_url = ks.relays.first().context("no relay configured")?;
-    let stream_hex = ks.guestbook_keys()?.public_key().to_hex();
-    let wraps = relay::wraps_by_author(relay_url, &stream_hex)?;
+    let authors = ks.guestbook_author_ring()?;
+    let wraps = relay::wraps_by_authors(relay_url, &authors)?;
     let events = collab::read_all(&ks, &wraps);
     Ok(collab::fold_threads(events))
 }
@@ -1257,7 +1259,10 @@ fn run_pending_rotation(repo_dir: &Path, ks: &Keystore, p: &PendingEpoch) -> Res
         ks.state_key = sk.clone();
     }
     if let Some(ck) = &p.collab_key {
-        ks.collab_key = ck.clone();
+        // Retire the outgoing #collab key into the prior-key ring (GitLab
+        // #21) — ks.epoch is still the OLD epoch here, which is exactly the
+        // ring key. No-op when re-adopting on a resume.
+        ks.adopt_collab_key(ck.clone());
     }
     ks.write_secret = Some(p.write_secret.clone());
     ks.roster = p.roster.clone();
@@ -1555,9 +1560,26 @@ pub fn revoke(repo_dir: &Path, banned_npub: &str) -> Result<String> {
         roster: new_roster.clone(),
         banned: new_banned.clone(),
     })?;
+    // Hand the prior-key ring to retained members (GitLab #21): the outgoing
+    // key joins the ring they receive, so even a member who joined after an
+    // earlier refounding can read the full retained back-history. With the
+    // retain knob off, nothing is handed over — history ends here by policy.
+    let mut slot_priors = ks.prior_collab_keys.clone();
+    if ks.retain_collab_history {
+        slot_priors.insert(
+            old_epoch,
+            PriorCollabKey {
+                key: ks.collab_key.clone(),
+                retired_at: now_secs(),
+            },
+        );
+    } else {
+        slot_priors.clear();
+    }
     let collab_payload = serde_json::to_vec(&rekey::CollabSlot {
         collab_key: hex::encode(new_collab_key),
         epoch: new_epoch,
+        prior_collab_keys: slot_priors,
     })?;
     let write_payload = serde_json::to_vec(&rekey::WriteSlot {
         write_secret: hex::encode(new_write_secret),
@@ -2138,7 +2160,22 @@ pub fn fold(community_id: &str, member_keys: &nostr::Keys) -> Result<u32> {
                     if slot.epoch != next {
                         bail!("collab slot epoch mismatch");
                     }
-                    ks.collab_key = slot.collab_key;
+                    // GitLab #21: merge the owner-handed priors FIRST (their
+                    // retired_at stamps are authoritative — the tenant-signed
+                    // slot recorded them at rotation time, not at this
+                    // possibly-much-later fold), keys we already hold win on
+                    // collision; then retire the outgoing key (ks.epoch is
+                    // still the pre-fold epoch, and adopt keeps a same-key
+                    // slot entry's stamp). The retain knob gates both.
+                    if ks.retain_collab_history {
+                        for (ep, prior) in &slot.prior_collab_keys {
+                            ks.prior_collab_keys
+                                .entry(*ep)
+                                .or_insert_with(|| prior.clone());
+                        }
+                    }
+                    ks.adopt_collab_key(slot.collab_key);
+                    ks.prune_prior_collab_keys();
                 }
                 Scope::Write => match slot {
                     Some(bytes) => {
@@ -2629,6 +2666,8 @@ mod tests {
             manifest_prev: None,
             roster: vec![],
             banned: vec![],
+            prior_collab_keys: Default::default(),
+            retain_collab_history: true,
         }
     }
 

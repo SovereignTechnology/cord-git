@@ -247,6 +247,13 @@ pub struct StateSlot {
 pub struct CollabSlot {
     pub collab_key: String,
     pub epoch: u32,
+    /// Prior `#collab` keys (epoch → key + retirement time) for retained
+    /// members (GitLab #21): lets a member who joined after some key was
+    /// retired still read the full retained back-history. `serde(default)`
+    /// keeps pre-ring rekey payloads parseable, and pre-ring clients ignore
+    /// the extra field.
+    #[serde(default)]
+    pub prior_collab_keys: std::collections::BTreeMap<u32, crate::keystore::PriorCollabKey>,
 }
 
 /// Write-scope slot payload (push-role members only).
@@ -516,6 +523,17 @@ impl CollabSlot {
         if !is_hex_exact(&self.collab_key, 64) {
             bail!("collab slot carries an invalid hex key");
         }
+        if self.prior_collab_keys.len() > crate::keystore::MAX_PRIOR_COLLAB_KEYS {
+            bail!("collab slot carries more prior keys than the retention cap");
+        }
+        for (epoch, prior) in &self.prior_collab_keys {
+            if !is_hex_exact(&prior.key, 64) {
+                bail!("collab slot carries an invalid prior key");
+            }
+            if *epoch >= self.epoch {
+                bail!("collab slot prior-key epoch {epoch} is not prior to the slot epoch");
+            }
+        }
         Ok(())
     }
 }
@@ -722,6 +740,7 @@ mod tests {
         let payload = serde_json::to_vec(&CollabSlot {
             collab_key: hex::encode([5u8; 32]),
             epoch: 1,
+            prior_collab_keys: Default::default(),
         })
         .unwrap();
         let (wrap, _raw) = build_rekey(
@@ -784,6 +803,7 @@ mod tests {
         let payload = serde_json::to_vec(&CollabSlot {
             collab_key: hex::encode([5u8; 32]),
             epoch: 1,
+            prior_collab_keys: Default::default(),
         })
         .unwrap();
         // Demote-shape epoch: write-only is expressible...
@@ -833,6 +853,30 @@ mod tests {
             parsed.epoch_scopes,
             vec![Scope::State, Scope::Collab, Scope::Write]
         );
+    }
+
+    #[test]
+    fn collab_slot_prior_key_ring_is_wire_compatible_and_validated() {
+        let prior = |k: &str| crate::keystore::PriorCollabKey {
+            key: k.to_string(),
+            retired_at: 1_700_000_000,
+        };
+        // Pre-ring payload shape (GitLab #21): no prior_collab_keys field.
+        let old: CollabSlot =
+            serde_json::from_str(&format!(r#"{{"collab_key":"{}","epoch":3}}"#, "aa".repeat(32)))
+                .unwrap();
+        assert!(old.prior_collab_keys.is_empty());
+        old.validate().unwrap();
+
+        // Ring entries must be 64-hex and strictly prior to the slot epoch.
+        let mut slot = old.clone();
+        slot.prior_collab_keys.insert(1, prior(&"bb".repeat(32)));
+        slot.validate().unwrap();
+        slot.prior_collab_keys.insert(2, prior(&"zz".repeat(32)));
+        assert!(slot.validate().is_err());
+        let mut slot = old.clone();
+        slot.prior_collab_keys.insert(3, prior(&"bb".repeat(32)));
+        assert!(slot.validate().is_err());
     }
 
     #[test]

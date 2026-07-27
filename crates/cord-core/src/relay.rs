@@ -173,8 +173,12 @@ pub fn giftwraps_for(relay_url: &str, recipient_hex: &str) -> Result<Vec<Event>>
     fetch_all(relay_url, filter)
 }
 
-/// Kind-1059 wraps authored by a given outer key (a derived stream/rekey
-/// address key). Raw, unauthenticated — callers MUST verify + parse.
+/// Kind-1059 wraps authored by ANY of the given outer keys (derived
+/// stream/rekey address keys). NIP-01 `authors` is an array: the
+/// `#collab`/guestbook read paths pass the current derived stream pubkey
+/// plus every retained prior one (GitLab #21 — pre-refounding wraps live
+/// under prior stream keys and would otherwise never be fetched at all).
+/// Raw, unauthenticated — callers MUST verify + parse.
 /// Until-paginated (GitLab !13): rekey addresses are admitted during rotation
 /// windows and ANY member can flood them with now-dated junk; genuine rekeys
 /// are past-tweaked (up to 2 days back), so a fixed newest-first limit window
@@ -182,8 +186,8 @@ pub fn giftwraps_for(relay_url: &str, recipient_hex: &str) -> Result<Vec<Event>>
 /// paginate backwards until the relay reports exhaustion; callers skip
 /// unparseable wraps, so junk only costs bandwidth (bounded by the tenant's
 /// storage quota on the server side).
-pub fn wraps_by_author(relay_url: &str, author_hex: &str) -> Result<Vec<Event>> {
-    let filter = serde_json::json!({ "kinds": [1059], "authors": [author_hex] });
+pub fn wraps_by_authors(relay_url: &str, author_hexes: &[String]) -> Result<Vec<Event>> {
+    let filter = serde_json::json!({ "kinds": [1059], "authors": author_hexes });
     fetch_all(relay_url, filter)
 }
 
