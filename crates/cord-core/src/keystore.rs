@@ -3,6 +3,7 @@
 //! community; the server holds none of this. Files are written 0600 and never
 //! logged. See design §5.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -94,6 +95,71 @@ pub struct Keystore {
     /// state-scope rekey slots).
     #[serde(default)]
     pub banned: Vec<BanEntry>,
+    /// Prior `#collab` channel keys retained across refoundings, keyed by the
+    /// LAST epoch each key was current for (GitLab #21). These keep
+    /// pre-revocation `#collab`/guestbook history readable for retained
+    /// members — GitHub-parity: removing a collaborator destroys nothing for
+    /// everyone else. STRICTLY read-only AND retirement-bounded: writing
+    /// always uses `collab_key`, and wraps matched to a retired key are
+    /// rejected unless their inner rumor predates the key's retirement — a
+    /// revoked member must not keep WRITE access to history streams either.
+    #[serde(default)]
+    pub prior_collab_keys: BTreeMap<u32, PriorCollabKey>,
+    /// Policy knob (GitLab #21): retain prior `#collab` keys across
+    /// refoundings. Default TRUE (GitHub parity). Off = the pre-fix
+    /// behaviour, now as a stated policy: every revoke truncates history,
+    /// and a device compromise exposes only the current epoch.
+    #[serde(default = "default_retain_history")]
+    pub retain_collab_history: bool,
+}
+
+fn default_retain_history() -> bool {
+    true
+}
+
+/// Hard cap on retained prior `#collab` keys. Bounds three things at once:
+/// rekey-slot payload growth against the NIP-44 plaintext ceiling (a ring
+/// that outgrows it would brick `revoke` itself), invite-bundle growth, and
+/// what a hostile owner can stuff into a member's keystore via slot priors.
+/// At ~90 JSON bytes/entry this stays far below the 64 KiB NIP-44 limit.
+pub const MAX_PRIOR_COLLAB_KEYS: usize = 256;
+
+/// One retired `#collab` key (GitLab #21).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorCollabKey {
+    /// The retired channel key (hex).
+    pub key: String,
+    /// When the key stopped being current (unix seconds) — the read-side
+    /// acceptance bound for wraps under this key: anything whose INNER rumor
+    /// is dated after `retired_at` + slack is a post-revocation injection by
+    /// an old-key holder, not history, and is rejected.
+    pub retired_at: u64,
+}
+
+/// One entry of the readable `#collab` key ring: the current key (unbounded)
+/// or a retired prior (bounded by its last epoch + retirement time).
+#[derive(Debug, Clone, Copy)]
+pub struct CollabRingEntry {
+    pub key: [u8; 32],
+    /// `None` = the current key; `Some((last_epoch, retired_at))` for priors.
+    pub retired: Option<(u32, u64)>,
+}
+
+/// The precomputed `#collab` ring: derived stream pubkey → ring entry.
+/// Built once per read batch via [`Keystore::collab_ring`].
+pub struct CollabRing {
+    entries: Vec<(nostr::PublicKey, CollabRingEntry)>,
+}
+
+impl CollabRing {
+    /// The ring entry whose derived stream key signed this outer author, if
+    /// any — current key first, then priors newest-to-oldest.
+    pub fn match_author(&self, author: &nostr::PublicKey) -> Option<&CollabRingEntry> {
+        self.entries
+            .iter()
+            .find(|(pk, _)| pk == author)
+            .map(|(_, e)| e)
+    }
 }
 
 impl Keystore {
@@ -176,6 +242,92 @@ impl Keystore {
     /// Derived guestbook stream keypair (shared across members via `#collab`).
     pub fn guestbook_keys(&self) -> Result<Keys> {
         crypto::derive_guestbook_keys(&self.collab_key_bytes()?)
+    }
+
+    /// Adopt a rolled `#collab` key, retiring the outgoing one into the
+    /// prior-key ring (keyed by the epoch it was last current for) so
+    /// pre-refounding history stays readable (GitLab #21). Honors the retain
+    /// knob: off = drop all history at the roll instead. No-op when the key
+    /// is unchanged (idempotent across resume/re-adoption paths). An entry
+    /// already present at this epoch with the SAME key (e.g. merged from an
+    /// owner-stamped rekey slot) keeps its authoritative `retired_at`; a
+    /// mismatched key is overwritten — the keys we held ourselves win.
+    pub fn adopt_collab_key(&mut self, new_key: String) {
+        if new_key == self.collab_key {
+            return;
+        }
+        if self.retain_collab_history {
+            let outgoing = std::mem::replace(&mut self.collab_key, new_key);
+            let entry = self
+                .prior_collab_keys
+                .entry(self.epoch)
+                .or_insert_with(|| PriorCollabKey {
+                    key: outgoing.clone(),
+                    retired_at: crate::events::now_secs(),
+                });
+            if entry.key != outgoing {
+                entry.key = outgoing;
+                entry.retired_at = crate::events::now_secs();
+            }
+            self.prune_prior_collab_keys();
+        } else {
+            self.prior_collab_keys.clear();
+            self.collab_key = new_key;
+        }
+    }
+
+    /// Enforce [`MAX_PRIOR_COLLAB_KEYS`], dropping the OLDEST epochs first
+    /// (retain-last-N semantics — the documented cost of the cap).
+    pub fn prune_prior_collab_keys(&mut self) {
+        while self.prior_collab_keys.len() > MAX_PRIOR_COLLAB_KEYS {
+            let oldest = *self
+                .prior_collab_keys
+                .keys()
+                .next()
+                .expect("non-empty map has a first key");
+            self.prior_collab_keys.remove(&oldest);
+        }
+    }
+
+    /// Every `#collab` key this keystore may READ under: the current key
+    /// first, then retained priors newest-to-oldest, each carrying its
+    /// (last_epoch, retired_at) acceptance bound. Writing (new wraps, joins,
+    /// invites' current key) always uses `collab_key` alone.
+    pub fn collab_key_ring(&self) -> Result<Vec<CollabRingEntry>> {
+        let mut ring = vec![CollabRingEntry {
+            key: self.collab_key_bytes()?,
+            retired: None,
+        }];
+        for (epoch, prior) in self.prior_collab_keys.iter().rev() {
+            ring.push(CollabRingEntry {
+                key: hex32(&prior.key)?,
+                retired: Some((*epoch, prior.retired_at)),
+            });
+        }
+        Ok(ring)
+    }
+
+    /// Derived guestbook stream pubkeys (hex) across the whole ring, current
+    /// first — the NIP-01 `authors` set for fetching `#collab`/guestbook
+    /// wraps: after a refounding, pre-rotation wraps live under the PRIOR
+    /// derived stream pubkeys and would otherwise never be fetched at all.
+    pub fn guestbook_author_ring(&self) -> Result<Vec<String>> {
+        self.collab_key_ring()?
+            .iter()
+            .map(|e| Ok(crypto::derive_guestbook_keys(&e.key)?.public_key().to_hex()))
+            .collect()
+    }
+
+    /// Precompute the ring's derived stream pubkeys for batch parsing.
+    /// Deriving a stream key is an EC operation and a hostile relay controls
+    /// how many wraps a batch contains, so derivation must happen ONCE per
+    /// batch (O(wraps + ring)), never per wrap (O(wraps × ring)).
+    pub fn collab_ring(&self) -> Result<CollabRing> {
+        let mut entries = Vec::new();
+        for e in self.collab_key_ring()? {
+            entries.push((crypto::derive_guestbook_keys(&e.key)?.public_key(), e));
+        }
+        Ok(CollabRing { entries })
     }
 
     /// Derived write keypair (write-role only).
@@ -292,4 +444,119 @@ pub(crate) fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(not(unix))]
 fn set_dir_permissions_0700(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ks() -> Keystore {
+        Keystore {
+            community_id: "ab".repeat(32),
+            repo_name: "t".into(),
+            hosting_nsec: None,
+            tenant_pub: None,
+            owner_salt: "00".repeat(32),
+            community_root: Some("11".repeat(32)),
+            state_key: "22".repeat(32),
+            collab_key: "33".repeat(32),
+            write_secret: None,
+            epoch: 0,
+            alias: "cd".repeat(16),
+            relays: vec![],
+            servers: vec![],
+            role: Role::Read,
+            manifest_prev: None,
+            roster: vec![],
+            banned: vec![],
+            prior_collab_keys: BTreeMap::new(),
+            retain_collab_history: true,
+        }
+    }
+
+    #[test]
+    fn adopt_collab_key_retires_into_the_ring() {
+        let mut k = ks();
+        let k0 = k.collab_key.clone();
+        // Same key: no-op (resume/idempotent adoption paths re-adopt).
+        k.adopt_collab_key(k0.clone());
+        assert!(k.prior_collab_keys.is_empty());
+        // Roll at epoch 0, then advance and roll again at epoch 3.
+        k.adopt_collab_key("44".repeat(32));
+        k.epoch = 3;
+        k.adopt_collab_key("55".repeat(32));
+        assert_eq!(k.prior_collab_keys.get(&0).unwrap().key, k0);
+        assert_eq!(k.prior_collab_keys.get(&3).unwrap().key, "44".repeat(32));
+        assert!(k.prior_collab_keys.get(&0).unwrap().retired_at > 0);
+        // Ring order: current first (unbounded), then priors newest-to-oldest
+        // carrying their (last_epoch, retired_at) bounds.
+        let ring = k.collab_key_ring().unwrap();
+        assert_eq!(hex::encode(ring[0].key), "55".repeat(32));
+        assert!(ring[0].retired.is_none());
+        assert_eq!(hex::encode(ring[1].key), "44".repeat(32));
+        assert_eq!(ring[1].retired.unwrap().0, 3);
+        assert_eq!(hex::encode(ring[2].key), k0);
+        assert_eq!(ring[2].retired.unwrap().0, 0);
+        // Author ring matches the derived stream key per ring entry.
+        let authors = k.guestbook_author_ring().unwrap();
+        assert_eq!(authors.len(), 3);
+        assert_eq!(
+            authors[0],
+            k.guestbook_keys().unwrap().public_key().to_hex()
+        );
+        // An owner-stamped entry already present for this epoch (same key,
+        // merged from a rekey slot) keeps its authoritative retired_at.
+        let mut k2 = ks();
+        let cur = k2.collab_key.clone();
+        k2.prior_collab_keys.insert(
+            0,
+            PriorCollabKey {
+                key: cur,
+                retired_at: 12345,
+            },
+        );
+        k2.adopt_collab_key("66".repeat(32));
+        assert_eq!(k2.prior_collab_keys.get(&0).unwrap().retired_at, 12345);
+        // The cap drops the OLDEST epochs first.
+        let mut k3 = ks();
+        for e in 0..(MAX_PRIOR_COLLAB_KEYS as u32 + 10) {
+            k3.epoch = e;
+            k3.adopt_collab_key(hex::encode(crypto::random_32()));
+        }
+        assert_eq!(k3.prior_collab_keys.len(), MAX_PRIOR_COLLAB_KEYS);
+        assert!(!k3.prior_collab_keys.contains_key(&0));
+    }
+
+    #[test]
+    fn retain_knob_off_drops_history_on_roll() {
+        let mut k = ks();
+        k.adopt_collab_key("44".repeat(32));
+        assert_eq!(k.prior_collab_keys.len(), 1);
+        k.retain_collab_history = false;
+        k.epoch = 1;
+        k.adopt_collab_key("55".repeat(32));
+        assert!(k.prior_collab_keys.is_empty());
+        assert_eq!(k.collab_key_ring().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pre_ring_keystore_json_still_loads() {
+        // On-disk keystores from before GitLab #21 carry neither the ring
+        // nor the knob — they must load with an empty ring and retention ON.
+        let mut k = ks();
+        k.prior_collab_keys.insert(
+            0,
+            PriorCollabKey {
+                key: "44".repeat(32),
+                retired_at: 1,
+            },
+        );
+        let mut v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("prior_collab_keys");
+        v.as_object_mut().unwrap().remove("retain_collab_history");
+        let back: Keystore = serde_json::from_value(v).unwrap();
+        assert!(back.prior_collab_keys.is_empty());
+        assert!(back.retain_collab_history);
+    }
 }

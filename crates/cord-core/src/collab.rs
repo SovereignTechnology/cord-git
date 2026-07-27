@@ -41,7 +41,7 @@ use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::crypto;
 use crate::events::FUTURE_SLACK_SECS;
-use crate::keystore::Keystore;
+use crate::keystore::{CollabRing, Keystore};
 
 /// NIP-34 issue.
 pub const KIND_ISSUE: u16 = 1621;
@@ -297,19 +297,36 @@ pub fn parse_collab(ks: &Keystore, wrap: &Event) -> Result<CollabEvent> {
 /// [`parse_collab`] with an explicit wall clock, so the future-dating bound is
 /// testable without sleeping. `now` is seconds since the Unix epoch.
 pub fn parse_collab_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<CollabEvent> {
+    parse_collab_with_ring(ks, &ks.collab_ring()?, wrap, now)
+}
+
+/// [`parse_collab_at`] against a pre-built ring: the EC stream-key
+/// derivations happen once per BATCH (hostile relays control the wrap
+/// count), never per wrap.
+fn parse_collab_with_ring(
+    ks: &Keystore,
+    ring: &CollabRing,
+    wrap: &Event,
+    now: u64,
+) -> Result<CollabEvent> {
     wrap.verify()
         .map_err(|e| anyhow!("collab wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_WRAP) {
         bail!("not a 1059 wrap");
     }
-    let stream = ks.guestbook_keys()?;
-    if wrap.pubkey != stream.public_key() {
-        bail!("wrap outer signer is not the derived #collab stream key");
-    }
+    // Match the outer signer against the derived stream key of the CURRENT
+    // #collab key first, then every retained prior key (GitLab #21: history
+    // survives refoundings). Stream key and seal key derive from the SAME
+    // collab key, so the matched ring entry also selects the seal key below —
+    // a wrap authored under one epoch's stream key must open under that
+    // epoch's seal key, never a cross-epoch mix.
+    let Some(entry) = ring.match_author(&wrap.pubkey) else {
+        bail!("wrap outer signer is not a derived #collab stream key (current or retained prior)");
+    };
     let sealed = base64::engine::general_purpose::STANDARD
         .decode(wrap.content.as_bytes())
         .map_err(|_| anyhow!("collab wrap content is not base64"))?;
-    let seal_key = crypto::collab_seal_key(&ks.collab_key_bytes()?);
+    let seal_key = crypto::collab_seal_key(&entry.key);
     let raw = crypto::open_symmetric(&seal_key, &sealed)?;
     let inner = Event::from_json(String::from_utf8_lossy(&raw).as_ref())
         .map_err(|e| anyhow!("sealed collab payload is not an event: {e}"))?;
@@ -329,9 +346,28 @@ pub fn parse_collab_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<CollabEv
     if inner.created_at.as_secs() > now.saturating_add(FUTURE_SLACK_SECS) {
         bail!("collab rumor is future-dated beyond {FUTURE_SLACK_SECS}s of slack (status-pin rejected)");
     }
+    // Retired keys are READ-ONLY history (GitLab #21): a wrap under a prior
+    // key whose inner rumor postdates the key's retirement is a
+    // post-revocation injection by an old-key holder — the revocation's
+    // write cliff must survive the ring. (Backdated injections remain
+    // possible and are irreducible with symmetric keys: indistinguishable
+    // from messages legitimately sent while the key was current. They can
+    // never out-sort post-revocation activity, which is dated later.)
+    if let Some((_, retired_at)) = entry.retired {
+        if inner.created_at.as_secs() > retired_at.saturating_add(FUTURE_SLACK_SECS) {
+            bail!(
+                "collab rumor under a retired #collab key postdates the key's retirement \
+                 (post-revocation injection rejected)"
+            );
+        }
+    }
 
     // Mandated binding checks (plan §2): a-tag community coordinate + channel +
-    // epoch. These are what stop cross-repo and cross-epoch replay.
+    // epoch. These are what stop cross-repo and cross-epoch replay. The epoch
+    // bound is tied to the MATCHED ring entry: a retired key was last current
+    // at its ring epoch, so a rumor under it claiming a later epoch is a
+    // forgery signal, not history (GitLab #21).
+    let epoch_bound = entry.retired.map(|(ep, _)| ep).unwrap_or(ks.epoch);
     let want_a = a_coord(ks)?;
     let mut a_ok = false;
     let mut channel_ok = false;
@@ -354,7 +390,7 @@ pub fn parse_collab_at(ks: &Keystore, wrap: &Event, now: u64) -> Result<CollabEv
             // seal key above fails to decrypt). A tag claiming a FUTURE epoch is
             // a cross-epoch replay/forgery signal and is rejected.
             "epoch" if v.len() >= 2 => {
-                epoch_ok = v[1].parse::<u32>().map(|e| e <= ks.epoch).unwrap_or(false);
+                epoch_ok = v[1].parse::<u32>().map(|e| e <= epoch_bound).unwrap_or(false);
             }
             "subject" if v.len() >= 2 && subject.is_none() => subject = Some(v[1].clone()),
             "e" if v.len() >= 2 => {
@@ -454,10 +490,14 @@ pub fn fold_threads(mut events: Vec<CollabEvent>) -> Vec<Thread> {
 /// events that verify and bind to this community/epoch. Best-effort: individual
 /// unreadable wraps (foreign, wrong-epoch, tampered) are skipped, not fatal.
 ///
-/// READABILITY BOUNDARY: the outer stream key and seal key are derived from the
-/// CURRENT `#collab` key, which rolls on every refounding (revoke). So this only
-/// ever returns messages published since the most recent rekey — history before
-/// a rotation is intentionally unreadable with the current keys.
+/// READABILITY BOUNDARY (GitLab #21): the outer stream key and seal key derive
+/// from the `#collab` key. The CURRENT key reads everything since the last
+/// refounding; the retained prior-key ring (`Keystore::prior_collab_keys`)
+/// extends reads back across refoundings — GitHub parity: a revoke destroys
+/// nothing for retained members. With retention off (or a prior key never
+/// held/handed over) history before the corresponding rekey stays unreadable.
+/// A REVOKED member never receives the post-roll key, so content created after
+/// their revocation stays unreadable to them regardless of the ring.
 pub fn read_all(ks: &Keystore, wraps: &[Event]) -> Vec<CollabEvent> {
     read_all_at(ks, wraps, crate::events::now_secs())
 }
@@ -465,9 +505,13 @@ pub fn read_all(ks: &Keystore, wraps: &[Event]) -> Vec<CollabEvent> {
 /// [`read_all`] with an explicit wall clock. The clock is sampled once by the
 /// caller so every wrap in a batch is judged against the same instant.
 pub fn read_all_at(ks: &Keystore, wraps: &[Event], now: u64) -> Vec<CollabEvent> {
+    // One ring derivation pass for the whole (relay-controlled) batch.
+    let Ok(ring) = ks.collab_ring() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for w in wraps {
-        if let Ok(ev) = parse_collab_at(ks, w, now) {
+        if let Ok(ev) = parse_collab_with_ring(ks, &ring, w, now) {
             out.push(ev);
         }
     }
@@ -504,6 +548,8 @@ mod tests {
             manifest_prev: None,
             roster: vec![],
             banned: vec![],
+            prior_collab_keys: Default::default(),
+            retain_collab_history: true,
         }
     }
 
@@ -662,6 +708,112 @@ mod tests {
         let far = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra, now + 10 * 365 * 86_400);
         let err = parse_collab_at(&ks, &far, now).unwrap_err().to_string();
         assert!(err.contains("future-dated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn retained_member_reads_prior_epoch_history_after_refounding() {
+        // GitLab #21 fix target: a refounding rolls the #collab key; a
+        // retained member's ring must keep pre-roll issues readable while
+        // the current key reads post-roll ones — both in one read_all pass.
+        let ks0 = owner_keystore();
+        let author = Keys::generate();
+        let old_issue = build_issue(&author, &ks0, "pre-revoke issue", "old body").unwrap();
+
+        // Refounding: the key rolls, the outgoing key retires into the ring.
+        let mut ks1 = ks0.clone();
+        ks1.adopt_collab_key(hex::encode(crypto::random_32()));
+        ks1.epoch = 1;
+        let new_issue = build_issue(&author, &ks1, "post-revoke issue", "new body").unwrap();
+
+        let wraps = vec![old_issue.wrap.clone(), new_issue.wrap.clone()];
+        let evs = read_all(&ks1, &wraps);
+        assert_eq!(evs.len(), 2, "retained member must read across the roll");
+        assert_eq!(fold_threads(evs).len(), 2);
+
+        // The REVOKED member's view (old key only, never receives the new
+        // one): pre-roll stays readable, post-roll never is.
+        let evs = read_all(&ks0, &wraps);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].subject.as_deref(), Some("pre-revoke issue"));
+
+        // Retention off: the roll drops the ring and pre-roll history with it.
+        let mut ks_off = ks0.clone();
+        ks_off.retain_collab_history = false;
+        ks_off.adopt_collab_key(ks1.collab_key.clone());
+        ks_off.epoch = 1;
+        let evs = read_all(&ks_off, &wraps);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].subject.as_deref(), Some("post-revoke issue"));
+    }
+
+    #[test]
+    fn cross_epoch_key_mixing_is_rejected() {
+        // A wrap authored by the PRIOR stream key but sealed under the NEW
+        // seal key (or vice versa) must not parse: the matched ring entry
+        // selects BOTH the stream key and the seal key.
+        let ks0 = owner_keystore();
+        let author = Keys::generate();
+        let mut ks1 = ks0.clone();
+        ks1.adopt_collab_key(hex::encode(crypto::random_32()));
+        ks1.epoch = 1;
+
+        let tags = binding_tags(&ks1).unwrap();
+        let rumor = EventBuilder::new(Kind::Custom(KIND_ISSUE), "b")
+            .tags(tags)
+            .finalize(&author)
+            .unwrap();
+        // Seal under the NEW key, sign the outer with the OLD stream key.
+        let seal_key = crypto::collab_seal_key(&ks1.collab_key_bytes().unwrap());
+        let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
+        let mixed = EventBuilder::new(
+            Kind::Custom(KIND_WRAP),
+            base64::engine::general_purpose::STANDARD.encode(sealed),
+        )
+        .custom_created_at(Timestamp::tweaked(0..172_800))
+        .finalize(&ks0.guestbook_keys().unwrap())
+        .unwrap();
+        assert!(parse_collab(&ks1, &mixed).is_err());
+    }
+
+    #[test]
+    fn post_retirement_injection_under_retired_key_is_rejected() {
+        // The revocation write cliff survives the ring: a wrap under a
+        // RETIRED key is history only if its inner rumor predates the
+        // retirement (+slack). A revoked member holding the old key must not
+        // be able to inject new content, even via a colluding relay.
+        let ks0 = owner_keystore();
+        let author = Keys::generate();
+        let now = crate::events::now_secs();
+
+        let mut ks1 = ks0.clone();
+        ks1.adopt_collab_key(hex::encode(crypto::random_32()));
+        ks1.epoch = 1;
+        let retired_at = ks1.prior_collab_keys.get(&0).unwrap().retired_at;
+
+        let extra = vec![Tag::custom("subject", vec!["s".to_string()])];
+        // Content from while the key was current: history, stays readable
+        // arbitrarily far in the future.
+        let old_ok =
+            seal_rumor_dated(&author, &ks0, KIND_ISSUE, "b", extra.clone(), retired_at - 10);
+        assert!(parse_collab_at(&ks1, &old_ok, now + 30 * 86_400).is_ok());
+
+        // Post-retirement injection under the old key: rejected even long
+        // after, when the wall-clock future bound alone would not flag it.
+        let later = retired_at + FUTURE_SLACK_SECS + 61;
+        let inject = seal_rumor_dated(&author, &ks0, KIND_ISSUE, "b", extra.clone(), later);
+        let err = parse_collab_at(&ks1, &inject, later + 86_400)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("retirement"), "unexpected error: {err}");
+
+        // Epoch bound rides the matched ring entry: a rumor sealed under the
+        // retired epoch-0 key but TAGGED with the current epoch is a forgery
+        // signal, not history.
+        let mut ks_lie = ks0.clone();
+        ks_lie.epoch = 1; // binding_tags stamps epoch 1, seals under key 0
+        let epoch_lie =
+            seal_rumor_dated(&author, &ks_lie, KIND_ISSUE, "b", extra, retired_at - 10);
+        assert!(parse_collab_at(&ks1, &epoch_lie, now).is_err());
     }
 
     #[test]

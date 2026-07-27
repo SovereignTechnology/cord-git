@@ -14,7 +14,10 @@
 # partial-publish resume to a lagging node + staged-epoch-fork refusal.
 # #collab: issues/PRs/comments as signed NIP-34 rumors on the #collab stream
 # (member A files + comments, member B reads; a revoked member cannot read
-# newly filed issues after the #collab key rolls).
+# newly filed issues after the #collab key rolls). History retention
+# (GitLab #21): a refounding must NOT truncate #collab/guestbook history for
+# retained members, and invited newcomers receive the prior-key ring
+# (GitHub-parity: removing a collaborator destroys nothing for everyone else).
 # Exit 0 = all green.
 set -uo pipefail
 
@@ -489,6 +492,22 @@ else
   fail "pr new/list"; echo "$PR_OUT"; CORD_GIT_HOME="$READER_HOME" "$CORD_BIN" pr list --dir "$READER_REPO" 2>&1
 fi
 
+# 23b: GitLab #21 — a member who joins AFTER issues exist (same epoch, no
+# rotation involved) must read the existing back-history immediately.
+LATE_KEYS="$("$CORD_BIN" keygen)"
+LATE_NSEC="$(printf '%s\n' "$LATE_KEYS" | sed -n 's/^nsec: //p')"
+LATE_PUB="$(printf '%s\n' "$LATE_KEYS" | sed -n 's/^pubkey: //p')"
+CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" invite "$LATE_PUB" --via "$INBOX" --dir "$REPO_FRESH" >"$WORK/invite-late.log" 2>&1
+LATE_HOME="$WORK/late-cfg"
+LATE_REPO="$WORK/late-repo"
+if CORD_GIT_HOME="$LATE_HOME" "$CORD_BIN" join --nsec "$LATE_NSEC" --relay "$INBOX" >"$WORK/join-late.log" 2>&1 \
+   && CORD_GIT_HOME="$LATE_HOME" "$CORD_BIN" clone "$CID" "$LATE_REPO" >"$WORK/late-clone.log" 2>&1 \
+   && CORD_GIT_HOME="$LATE_HOME" "$CORD_BIN" issue list --dir "$LATE_REPO" 2>&1 | grep -q "login crashes on empty password"; then
+  pass "same-epoch late joiner reads pre-existing issues"
+else
+  fail "late joiner cannot read pre-existing issues"; CORD_GIT_HOME="$LATE_HOME" "$CORD_BIN" issue list --dir "$LATE_REPO" 2>&1
+fi
+
 # --- Phase 4a: promote / demote / revoke with §3.3 sequencing ---------------
 
 # 24: promotion must ride the member's inbox relay, never the git node.
@@ -660,6 +679,14 @@ if printf '%s' "$ROSTER2_OUT" | grep -q "banned $WRITER_PUB"; then
 else
   fail "roster missing the ban"; echo "$ROSTER2_OUT"
 fi
+# GitLab #21: guestbook join history survives the refounding too — the joins
+# were recorded under the PRE-revoke stream key (shared derivation with
+# #collab), and a revoke must not erase who ever joined.
+if printf '%s' "$ROSTER2_OUT" | grep -q "join $WRITER_PUB"; then
+  pass "roster join history survives the refounding (prior-stream-key ring)"
+else
+  fail "refounding truncated the guestbook join history"; echo "$ROSTER2_OUT"
+fi
 # 28c: after the REVOKE narrow, the next epoch's rekey addresses are again
 # unlisted — forgeries at them must be rejected at admission (binds the !13
 # listing change at the revoke narrow, not just the demote narrow).
@@ -687,12 +714,50 @@ if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" issue list --dir "$OWNER3" 2>&1 | gre
 else
   fail "retained owner cannot read post-revoke issue"; CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" issue list --dir "$OWNER3" 2>&1
 fi
+# 28b-2: GitLab #21 FIX TARGET — the refounding must NOT truncate history for
+# retained members (GitHub parity: removing a collaborator destroys nothing
+# for everyone else). Pre-fix this fails: the rolled key orphaned old wraps.
+if CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" issue list --dir "$OWNER3" 2>&1 | grep -q "login crashes on empty password"; then
+  pass "retained owner still reads the PRE-revoke issue (history survived the refounding)"
+else
+  fail "refounding truncated the owner's #collab history"
+  CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" issue list --dir "$OWNER3" 2>&1
+fi
+# ...and the retained (folded) reader keeps the full pre-revoke thread.
+if CORD_GIT_HOME="$READER_HOME" "$CORD_BIN" issue show "$ISSUE_ID" --dir "$READER_POSTREVOKE" 2>&1 | grep -q "i have a fix in progress"; then
+  pass "retained reader still reads the pre-revoke issue thread after folding"
+else
+  fail "refounding truncated the reader's #collab history"
+  CORD_GIT_HOME="$READER_HOME" "$CORD_BIN" issue show "$ISSUE_ID" --dir "$READER_POSTREVOKE" 2>&1
+fi
 # Revoked writer (old #collab key) cannot read the newly filed issue.
 REVOKED_LIST="$(CORD_GIT_HOME="$WRITER_HOME" "$CORD_BIN" issue list --dir "$WRITER2" 2>&1)"
 if printf '%s' "$REVOKED_LIST" | grep -q "post-revoke security note"; then
   fail "revoked member could read a newly filed issue"
 else
   pass "revoked member cannot read newly filed issues (#collab key rolled)"
+fi
+
+# 28b-3: GitLab #21 — GitHub parity for NEWCOMERS: a member invited AFTER the
+# revoke receives the prior-key ring inside the invite bundle and reads the
+# pre-revoke back-history, like a new collaborator on a private GitHub repo.
+NEW_KEYS="$("$CORD_BIN" keygen)"
+NEW_NSEC="$(printf '%s\n' "$NEW_KEYS" | sed -n 's/^nsec: //p')"
+NEW_PUB="$(printf '%s\n' "$NEW_KEYS" | sed -n 's/^pubkey: //p')"
+CORD_GIT_HOME="$OWNER_HOME" "$CORD_BIN" invite "$NEW_PUB" --via "$INBOX" --dir "$OWNER3" >"$WORK/invite-new.log" 2>&1
+NEW_HOME="$WORK/newcomer-cfg"
+NEW_REPO="$WORK/newcomer-repo"
+if CORD_GIT_HOME="$NEW_HOME" "$CORD_BIN" join --nsec "$NEW_NSEC" --relay "$INBOX" >"$WORK/join-new.log" 2>&1 \
+   && CORD_GIT_HOME="$NEW_HOME" "$CORD_BIN" clone "$CID" "$NEW_REPO" >"$WORK/new-clone.log" 2>&1; then
+  NEW_LIST="$(CORD_GIT_HOME="$NEW_HOME" "$CORD_BIN" issue list --dir "$NEW_REPO" 2>&1)"
+  if printf '%s' "$NEW_LIST" | grep -q "login crashes on empty password" \
+     && printf '%s' "$NEW_LIST" | grep -q "post-revoke security note"; then
+    pass "post-revoke newcomer reads BOTH pre- and post-revoke history (invite hand-back)"
+  else
+    fail "post-revoke newcomer is missing history"; echo "$NEW_LIST"
+  fi
+else
+  fail "post-revoke newcomer join/clone"; cat "$WORK/join-new.log" "$WORK/new-clone.log" 2>/dev/null
 fi
 
 # 28d: verify-round F-B — a member cross-alias SQUATS the NEXT epoch's
