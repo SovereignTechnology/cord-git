@@ -74,10 +74,19 @@ echo "=== workdir: $WORK ==="
 # Run from inside the data dir so the server's CWD-relative .relay-owner.nsec
 # lands in the throwaway workdir (cleaned up), never the repo.
 cd "$SRV_DATA" || exit 2
+# Server phase-4b compat: the shipped default registration mode is whitelist
+# (empty whitelist = reject all), and the write-rate / replacement-cadence
+# limiters default on. This harness registers throwaway tenants at will and
+# runs deliberate flood/rotation bursts, so it must pin open mode and disable
+# both limiters (0 = unlimited); the server suite (exit26/27/33) covers the
+# limiters themselves.
 NGIT_DOMAIN="127.0.0.1:${PORT}" \
 NGIT_BIND_ADDRESS="127.0.0.1:${PORT}" \
 NGIT_DATABASE_BACKEND=memory \
 NGIT_PRIVATE_REPOS_ENABLE=true \
+NGIT_PRIVATE_REGISTRATION_MODE=open \
+NGIT_PRIVATE_WRITE_RATE_CAPACITY=0 \
+NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY=0 \
 NGIT_RELAY_DATA_PATH="$SRV_DATA/relay" \
 NGIT_GIT_DATA_PATH="$SRV_DATA/git" \
 "$SERVER_BIN" >"$WORK/server.log" 2>&1 &
@@ -980,6 +989,8 @@ SRV2_DATA="$WORK/srvdata2"
 mkdir -p "$SRV2_DATA"
 (cd "$SRV2_DATA" && exec env NGIT_DOMAIN="127.0.0.1:${PORT2}" NGIT_BIND_ADDRESS="127.0.0.1:${PORT2}" \
   NGIT_DATABASE_BACKEND=memory NGIT_PRIVATE_REPOS_ENABLE=true \
+  NGIT_PRIVATE_REGISTRATION_MODE=open NGIT_PRIVATE_WRITE_RATE_CAPACITY=0 \
+  NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY=0 \
   NGIT_RELAY_DATA_PATH="$SRV2_DATA/relay" NGIT_GIT_DATA_PATH="$SRV2_DATA/git" \
   "$SERVER_BIN" >"$WORK/server2.log" 2>&1) &
 SRV2_PID=$!
@@ -1059,6 +1070,8 @@ fi
 # Restart B (empty: memory backend) and resume — must republish EVERYTHING to B.
 (cd "$SRV2_DATA" && exec env NGIT_DOMAIN="127.0.0.1:${PORT2}" NGIT_BIND_ADDRESS="127.0.0.1:${PORT2}" \
   NGIT_DATABASE_BACKEND=memory NGIT_PRIVATE_REPOS_ENABLE=true \
+  NGIT_PRIVATE_REGISTRATION_MODE=open NGIT_PRIVATE_WRITE_RATE_CAPACITY=0 \
+  NGIT_PRIVATE_REGISTRATION_REPLACE_CAPACITY=0 \
   NGIT_RELAY_DATA_PATH="$SRV2_DATA/relay" NGIT_GIT_DATA_PATH="$SRV2_DATA/git" \
   "$SERVER_BIN" >>"$WORK/server2.log" 2>&1) &
 SRV2_PID=$!
