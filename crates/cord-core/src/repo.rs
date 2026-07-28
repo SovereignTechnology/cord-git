@@ -127,6 +127,20 @@ pub struct Created {
     pub url: String,
 }
 
+/// Hosting/tenant key for `create`: generated fresh per community by default.
+/// When the node runs whitelist admission, the operator must pre-admit the
+/// hosting npub — so honor CORD_GIT_HOSTING_NSEC (nsec or hex; never argv,
+/// !19) to create with a pre-approved identity instead of a throwaway one.
+/// An invalid value is a loud error, never a silent fallback (the operator
+/// believes they are creating with the pre-admitted key).
+fn hosting_key_from_env() -> Result<nostr::Keys> {
+    match std::env::var("CORD_GIT_HOSTING_NSEC") {
+        Ok(s) if !s.trim().is_empty() => nostr::Keys::parse(s.trim())
+            .context("CORD_GIT_HOSTING_NSEC is not a valid nsec/hex secret key"),
+        _ => Ok(nostr::Keys::generate()),
+    }
+}
+
 /// `cord-git create` — generate all secrets, register (30640), persist the
 /// keystore, and drop a `.cord-git` pointer in `repo_dir`.
 pub fn create(
@@ -135,15 +149,7 @@ pub fn create(
     node_relay: &str,
     node_server: &str,
 ) -> Result<Created> {
-    // Hosting/tenant key: generated fresh per community by default. When the
-    // node runs whitelist admission, the operator must pre-admit the hosting
-    // npub — so honor CORD_GIT_HOSTING_NSEC (nsec or hex; never argv, !19) to
-    // create with a pre-approved identity instead of a throwaway one.
-    let hosting = match std::env::var("CORD_GIT_HOSTING_NSEC") {
-        Ok(s) if !s.trim().is_empty() => nostr::Keys::parse(s.trim())
-            .context("CORD_GIT_HOSTING_NSEC is not a valid nsec/hex secret key")?,
-        _ => nostr::Keys::generate(),
-    };
+    let hosting = hosting_key_from_env()?;
     let salt = crypto::random_32();
     let community_id = crypto::community_id(&hosting.public_key(), &salt);
     if Keystore::exists(&community_id) {
@@ -2854,5 +2860,53 @@ mod tests {
         let mut bad = template.clone();
         bad.content = "tampered".into();
         assert!(rebuild_registration(&bad.as_json(), &[], &tenant, 1).is_err());
+    }
+
+    // ---- hosting key from CORD_GIT_HOSTING_NSEC (whitelist-mode create) ----
+
+    /// Serial env-mutating test (one test fn on purpose, cf. pending_gate_paths).
+    #[test]
+    fn hosting_key_env_paths() {
+        use nostr::nips::nip19::ToBech32;
+        let prev = std::env::var("CORD_GIT_HOSTING_NSEC").ok();
+
+        // Unset → fresh throwaway key each call.
+        std::env::remove_var("CORD_GIT_HOSTING_NSEC");
+        let a = hosting_key_from_env().unwrap();
+        let b = hosting_key_from_env().unwrap();
+        assert_ne!(a.public_key(), b.public_key());
+
+        // Empty / whitespace-only → same generate fallback.
+        std::env::set_var("CORD_GIT_HOSTING_NSEC", "   ");
+        let c = hosting_key_from_env().unwrap();
+        assert_ne!(c.public_key(), a.public_key());
+
+        // Valid hex secret → exactly that key (surrounding whitespace tolerated).
+        let hex_sec = "11".repeat(32);
+        let expected = Keys::parse(&hex_sec).unwrap();
+        std::env::set_var("CORD_GIT_HOSTING_NSEC", format!("  {hex_sec}  "));
+        assert_eq!(
+            hosting_key_from_env().unwrap().public_key(),
+            expected.public_key()
+        );
+
+        // Valid nsec → same key.
+        let nsec = expected.secret_key().to_bech32().unwrap();
+        std::env::set_var("CORD_GIT_HOSTING_NSEC", &nsec);
+        assert_eq!(
+            hosting_key_from_env().unwrap().public_key(),
+            expected.public_key()
+        );
+
+        // Garbage → loud named error, never a silent fallback to a throwaway
+        // key the operator did NOT pre-admit.
+        std::env::set_var("CORD_GIT_HOSTING_NSEC", "not-a-key");
+        let e = hosting_key_from_env().unwrap_err();
+        assert!(format!("{e:#}").contains("CORD_GIT_HOSTING_NSEC"), "{e:#}");
+
+        match prev {
+            Some(v) => std::env::set_var("CORD_GIT_HOSTING_NSEC", v),
+            None => std::env::remove_var("CORD_GIT_HOSTING_NSEC"),
+        }
     }
 }
