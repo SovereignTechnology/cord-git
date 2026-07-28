@@ -135,7 +135,15 @@ pub fn create(
     node_relay: &str,
     node_server: &str,
 ) -> Result<Created> {
-    let hosting = nostr::Keys::generate();
+    // Hosting/tenant key: generated fresh per community by default. When the
+    // node runs whitelist admission, the operator must pre-admit the hosting
+    // npub — so honor CORD_GIT_HOSTING_NSEC (nsec or hex; never argv, !19) to
+    // create with a pre-approved identity instead of a throwaway one.
+    let hosting = match std::env::var("CORD_GIT_HOSTING_NSEC") {
+        Ok(s) if !s.trim().is_empty() => nostr::Keys::parse(s.trim())
+            .context("CORD_GIT_HOSTING_NSEC is not a valid nsec/hex secret key")?,
+        _ => nostr::Keys::generate(),
+    };
     let salt = crypto::random_32();
     let community_id = crypto::community_id(&hosting.public_key(), &salt);
     if Keystore::exists(&community_id) {
