@@ -17,6 +17,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a new private repo: register it and link the current directory.
+    /// Whitelist-mode nodes: set CORD_GIT_HOSTING_NSEC (nsec/hex, never argv)
+    /// to a hosting key the operator has pre-admitted, else a fresh key is
+    /// generated and the registration will be rejected.
     Create {
         /// Human-friendly repo name (local only; never sent to the server).
         name: String,
