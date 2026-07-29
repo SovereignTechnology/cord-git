@@ -465,7 +465,7 @@ fi
 # --- Phase 4a: #collab issues/PRs (signed NIP-34 rumors on the #collab stream)
 # Member A (writer) files an issue + comment; member B (reader) lists and reads
 # them — inner rumors are signed by the author identity, sealed under the
-# #collab key, and carried in aux-signed 1059 wraps.
+# #collab key, and carried in aux-signed 3359 stream wraps.
 ISSUE_OUT="$(CORD_GIT_HOME="$WRITER_HOME" CORD_GIT_NSEC="$WRITER_NSEC" "$CORD_BIN" issue new "login crashes on empty password" --body "steps: submit an empty form" --dir "$WRITER_REPO" 2>&1)"
 ISSUE_ID="$(printf '%s\n' "$ISSUE_OUT" | sed -n 's/^filed issue //p')"
 if [ -n "$ISSUE_ID" ]; then

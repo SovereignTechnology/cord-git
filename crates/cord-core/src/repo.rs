@@ -186,7 +186,7 @@ pub fn create(
     };
 
     // Register with the write key AND the derived guestbook stream key in the
-    // aux set (aux admits 1059 guestbook wraps but can never write blobs or
+    // aux set (aux admits 3359 guestbook wraps but can never write blobs or
     // state roots — the server enforces the split).
     let guestbook = ks.guestbook_keys()?;
     let reg = events::build_registration(
@@ -218,7 +218,7 @@ pub fn create(
 
 /// Build, publish, and confirm a guestbook Join for `member`; retains the raw
 /// rumor JSON bytes under the community dir (flip-public needs byte-exact
-/// republish). Returns the outer 1059 event id.
+/// republish). Returns the outer stream-wrap (3359) event id.
 fn publish_join(member: &nostr::Keys, ks: &Keystore) -> Result<String> {
     let relay_url = ks.relays.first().context("no relay configured")?;
     let (outer, raw) = invite::build_join(member, ks)?;
@@ -1400,10 +1400,12 @@ fn ensure_no_existing_rekeys(ks: &Keystore, hosting: &nostr::Keys, new_epoch: u3
     let prior_write = prior_secret.as_ref().map(|s| (s, ks.epoch));
     for scope in Scope::all() {
         let addr = rekey::rekey_address(&root, &ks.community_id, scope, new_epoch)?;
-        let filter = serde_json::json!({
-            "kinds": [rekey::KIND_WRAP],
-            "authors": [addr.public_key().to_hex()],
-        });
+        // Shared constructor, NOT a hand-built filter: the emit/read kind
+        // agreement is pinned on `relay::stream_wrap_filter` alone, and this
+        // guard FAILS OPEN (an empty fetch reads as "no rival rekeys, proceed
+        // to mint"), so a kind that drifted out from under it here would
+        // silently disarm the GitLab !14 fork check.
+        let filter = relay::stream_wrap_filter(&[addr.public_key().to_hex()]);
         let wraps = relay::fetch_all_multi(&ks.relays, filter)?;
         for wrap in &wraps {
             if rekey::parse_rekey(
@@ -2082,10 +2084,10 @@ pub fn fold(community_id: &str, member_keys: &nostr::Keys) -> Result<u32> {
         let mut genuine: Vec<(Scope, rekey::ParsedRekey)> = Vec::new();
         for scope in Scope::all() {
             let addr = rekey::rekey_address(&root, &ks.community_id, scope, next)?;
-            let filter = serde_json::json!({
-                "kinds": [rekey::KIND_WRAP],
-                "authors": [addr.public_key().to_hex()],
-            });
+            // Shared constructor (see `relay::stream_wrap_filter`) — this
+            // fetch spans every relay, so it cannot use `wraps_by_authors`,
+            // but the FILTER is still the pinned piece.
+            let filter = relay::stream_wrap_filter(&[addr.public_key().to_hex()]);
             let wraps = relay::fetch_all_multi(&ks.relays, filter)?;
             for wrap in &wraps {
                 // Forged/malformed wraps at the address are skipped; only a

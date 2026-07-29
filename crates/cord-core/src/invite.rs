@@ -1,4 +1,9 @@
-//! Direct Invite (kind-3313 NIP-59 giftwrap) and guestbook Join (1059 wrap).
+//! Direct Invite (kind-3313 NIP-59 giftwrap) and guestbook Join (3359 wrap).
+//!
+//! These two use DIFFERENT outer kinds and that is deliberate — see the pair
+//! of constants in `events.rs`. The invite is a genuine NIP-59 gift wrap
+//! (1059) bound for the invitee's inbox relay; the Join is a CORD stream wrap
+//! (3359) bound for the git node, sharing none of NIP-59's machinery.
 //!
 //! Plan §2/§4 (Direct Invite row) and spec §4 invite/join [D]:
 //! - The invite bundle carries everything a member needs (community id, node
@@ -7,7 +12,7 @@
 //!   the invitee's OWN inbox relay — NORMATIVE: never to the git nodes
 //!   (`NGIT_PRIVATE_ACCEPT_DIRECT_INVITES=false` stays false server-side).
 //! - The guestbook Join is published only AFTER the joiner holds the bundle;
-//!   its OUTER 1059 is signed by the derived guestbook stream key (registered
+//!   its OUTER 3359 is signed by the derived guestbook stream key (registered
 //!   in the 30640 `aux` set), never the member npub. The inner Join rumor is a
 //!   SIGNED event (member npub) sealed under a `#collab`-derived key, and its
 //!   raw JSON bytes are retained on disk for a future byte-exact flip-public
@@ -27,13 +32,11 @@ use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
-use crate::events::FUTURE_SLACK_SECS;
+use crate::events::{FUTURE_SLACK_SECS, KIND_NIP59_GIFT_WRAP, KIND_STREAM_WRAP};
 use crate::keystore::{Keystore, PriorCollabKey, Role, RosterEntry, MAX_PRIOR_COLLAB_KEYS};
 
 /// Direct invite rumor kind (Concord Direct Invite).
 pub const KIND_INVITE: u16 = 3313;
-/// NIP-59 gift wrap / CORD stream wrap outer kind.
-pub const KIND_WRAP: u16 = 1059;
 /// Guestbook Join rumor kind (CORD-git-native placeholder).
 pub const KIND_JOIN: u16 = 3314;
 
@@ -247,7 +250,7 @@ pub fn wrap_invite(bundle: &InviteBundle, invitee: &PublicKey) -> Result<Event> 
 fn unwrap_3313(keys: &Keys, wrap: &Event) -> Result<String> {
     wrap.verify()
         .map_err(|e| anyhow!("wrap has an invalid signature: {e}"))?;
-    if wrap.kind != Kind::Custom(KIND_WRAP) {
+    if wrap.kind != Kind::Custom(KIND_NIP59_GIFT_WRAP) {
         bail!("not a gift wrap (kind {})", wrap.kind.as_u16());
     }
     let gift = UnwrappedGift::from_gift_wrap(keys, wrap)
@@ -346,7 +349,7 @@ pub fn unwrap_promotion(keys: &Keys, wrap: &Event) -> Result<PromotionBundle> {
     Ok(bundle)
 }
 
-/// Build the guestbook Join for `member`. Returns the outer 1059 (signed by
+/// Build the guestbook Join for `member`. Returns the outer 3359 stream wrap (signed by
 /// the DERIVED guestbook stream key — never the member npub) plus the raw
 /// inner rumor JSON bytes, which the caller must retain for flip-public.
 pub fn build_join(member: &Keys, ks: &Keystore) -> Result<(Event, Vec<u8>)> {
@@ -365,7 +368,7 @@ pub fn build_join(member: &Keys, ks: &Keystore) -> Result<(Event, Vec<u8>)> {
     // Outer wrap: derived guestbook stream key, timestamp tweaked into the
     // past (NIP-59 discipline; the node rejects future-dating anyway).
     let gb = ks.guestbook_keys()?;
-    let outer = EventBuilder::new(Kind::Custom(KIND_WRAP), content)
+    let outer = EventBuilder::new(Kind::Custom(KIND_STREAM_WRAP), content)
         .custom_created_at(Timestamp::tweaked(0..172_800))
         .finalize(&gb)?;
     Ok((outer, raw))
@@ -416,8 +419,8 @@ fn parse_join_with_ring(
 ) -> Result<JoinInfo> {
     wrap.verify()
         .map_err(|e| anyhow!("guestbook wrap has an invalid signature: {e}"))?;
-    if wrap.kind != Kind::Custom(KIND_WRAP) {
-        bail!("not a 1059 wrap");
+    if wrap.kind != Kind::Custom(KIND_STREAM_WRAP) {
+        bail!("{}", crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16()));
     }
     // Ring match, exactly as parse_collab (GitLab #21): the current #collab
     // key's derived stream key first, then retained priors — join history
@@ -529,9 +532,10 @@ mod tests {
         let invitee = Keys::generate();
         let bundle = InviteBundle::from_keystore(&ks, Role::Write).unwrap();
         let wrap = wrap_invite(&bundle, &invitee.public_key()).unwrap();
-        // Wire hygiene: outer is 1059, p-tags the invitee, and neither the
+        // Wire hygiene: outer is NIP-59's 1059 (invites did NOT move to the
+        // 3359 stream kind), p-tags the invitee, and neither the
         // tenant pubkey nor any secret appears in the wrap JSON.
-        assert_eq!(wrap.kind.as_u16(), KIND_WRAP);
+        assert_eq!(wrap.kind.as_u16(), KIND_NIP59_GIFT_WRAP);
         let wire = wrap.as_json();
         assert!(!wire.contains(&ks.tenant_pub.clone().unwrap()));
         assert!(!wire.contains(ks.write_secret.as_ref().unwrap()));
@@ -585,6 +589,35 @@ mod tests {
         assert!(bundle.validate().is_err());
     }
 
+    /// The invite/join SPLIT, pinned on both sides. The guestbook Join is a
+    /// CORD stream wrap fetched by author; the invite is a genuine NIP-59 gift
+    /// wrap fetched by `#p` from the invitee's inbox relay. Each is asserted
+    /// against the REQ filter that actually fetches it, and against each
+    /// other: re-merging the two constants breaks this test.
+    #[test]
+    fn join_and_invite_use_their_own_readers_kinds() {
+        let ks = owner_keystore();
+        let member = Keys::generate();
+
+        let (join, _raw) = build_join(&member, &ks).unwrap();
+        assert_eq!(
+            join.kind.as_u16() as u64,
+            crate::relay::stream_wrap_filter_kind(),
+            "guestbook Join must be published at the stream-wrap kind"
+        );
+
+        let bundle = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
+        let invite = wrap_invite(&bundle, &member.public_key()).unwrap();
+        assert_eq!(
+            invite.kind.as_u16() as u64,
+            crate::relay::giftwrap_filter_kind(),
+            "invites must stay on the NIP-59 gift-wrap kind"
+        );
+
+        // The two planes are distinct on the wire.
+        assert_ne!(join.kind, invite.kind);
+    }
+
     #[test]
     fn join_roundtrip_and_bindings() {
         let ks = owner_keystore();
@@ -620,7 +653,7 @@ mod tests {
         let seal_key = crypto::guestbook_seal_key(&ks.collab_key_bytes().unwrap());
         let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
         let dated = EventBuilder::new(
-            Kind::Custom(KIND_WRAP),
+            Kind::Custom(KIND_STREAM_WRAP),
             base64::engine::general_purpose::STANDARD.encode(sealed),
         )
         .custom_created_at(Timestamp::tweaked(0..172_800))
@@ -631,7 +664,7 @@ mod tests {
 
         // An outer wrap signed by the member npub itself is rejected.
         let sealed = outer.content.clone();
-        let bad_outer = EventBuilder::new(Kind::Custom(KIND_WRAP), sealed)
+        let bad_outer = EventBuilder::new(Kind::Custom(KIND_STREAM_WRAP), sealed)
             .finalize(&member)
             .unwrap();
         assert!(parse_join(&ks, &bad_outer).is_err());
@@ -689,7 +722,7 @@ mod tests {
         let seal_key = crypto::guestbook_seal_key(&ks0.collab_key_bytes().unwrap());
         let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
         let injected = EventBuilder::new(
-            Kind::Custom(KIND_WRAP),
+            Kind::Custom(KIND_STREAM_WRAP),
             base64::engine::general_purpose::STANDARD.encode(sealed),
         )
         .custom_created_at(Timestamp::tweaked(0..172_800))

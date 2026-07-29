@@ -25,7 +25,7 @@
 //!   fresh ephemeral key to the member npub carrying the new secrets. A
 //!   member with no slot in a write-scope rekey concludes demoted/never-had;
 //!   no slot in a state-scope rekey concludes revoked (roster-fold rule).
-//! - outer: 1059 wrap signed by the derived rekey-pseudonym key (which MUST
+//! - outer: 3359 stream wrap signed by the derived rekey-pseudonym key (MUST
 //!   already be in the live 30640's aux set — §3.3 sequencing), content
 //!   sealed under a key derived from the prior root (operator-opaque).
 
@@ -38,12 +38,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::crypto;
+use crate::events::KIND_STREAM_WRAP;
 use crate::keystore::{BanEntry, RosterEntry};
 
 /// Concord rekey rumor kind.
 pub const KIND_REKEY: u16 = 3303;
-/// Outer wrap kind (same as every CORD stream event).
-pub const KIND_WRAP: u16 = 1059;
 
 /// The `group_key` derivation label for rekey addresses (Concord CORD-06
 /// pseudonym family). NORMATIVE per plan §2 revoke row.
@@ -283,7 +282,7 @@ struct RekeyContent {
 const REKEY_TYPE: &str = "cord-git-rekey";
 
 /// Build one rekey: inner 3303 rumor signed by the TENANT hosting key, outer
-/// 1059 wrap signed by the derived rekey-pseudonym key for
+/// 3359 stream wrap signed by the derived rekey-pseudonym key for
 /// (prior_root, scope, new_epoch).
 ///
 /// `slots` = (member identity pubkey, serialized slot payload) for every
@@ -365,7 +364,7 @@ pub fn build_rekey(
     let outer_content = base64::engine::general_purpose::STANDARD.encode(sealed);
 
     let addr = rekey_address(prior_root, community_id_hex, scope, new_epoch)?;
-    let outer = EventBuilder::new(Kind::Custom(KIND_WRAP), outer_content)
+    let outer = EventBuilder::new(Kind::Custom(KIND_STREAM_WRAP), outer_content)
         .custom_created_at(Timestamp::tweaked(0..172_800))
         .finalize(&addr)?;
     Ok((outer, raw))
@@ -408,8 +407,8 @@ pub fn parse_rekey(
 ) -> Result<ParsedRekey> {
     wrap.verify()
         .map_err(|e| anyhow!("rekey wrap has an invalid signature: {e}"))?;
-    if wrap.kind != Kind::Custom(KIND_WRAP) {
-        bail!("not a 1059 wrap");
+    if wrap.kind != Kind::Custom(KIND_STREAM_WRAP) {
+        bail!("{}", crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16()));
     }
     let addr = rekey_address(prior_root, community_id_hex, scope, expect_epoch)?;
     if wrap.pubkey != addr.public_key() {
@@ -554,6 +553,31 @@ mod tests {
 
     fn cid() -> String {
         "ab".repeat(32)
+    }
+
+    /// Emit/read kind agreement. A wrap published at a kind the REQ filter
+    /// does not name comes back EMPTY with NO error -- that is the whole
+    /// failure mode of the 1059 -> 3359 migration (silently empty `roster`,
+    /// `issue list`, `pr list`, `show`). Assert against the filter itself, so
+    /// moving one side without the other fails here instead of in production.
+    #[test]
+    fn rekey_wrap_kind_matches_the_read_filter() {
+        let hosting = Keys::generate();
+        let (wrap, _raw) = build_rekey(
+            &hosting,
+            &cid(),
+            &[7u8; 32],
+            Scope::State,
+            1,
+            &[],
+            None,
+            &[Scope::State],
+        )
+        .unwrap();
+        assert_eq!(
+            wrap.kind.as_u16() as u64,
+            crate::relay::stream_wrap_filter_kind()
+        );
     }
 
     #[test]
