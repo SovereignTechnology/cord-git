@@ -9,6 +9,8 @@ use nostr::Event;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
+use crate::events::{KIND_NIP59_GIFT_WRAP, KIND_STREAM_WRAP};
+
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
 fn set_read_timeout(ws: &mut Ws, dur: Duration) {
@@ -163,18 +165,30 @@ pub fn registration_candidates(relay_url: &str, alias: &str) -> Result<Vec<Event
     fetch(relay_url, filter)
 }
 
-/// Kind-1059 gift wraps addressed to `recipient_hex` (raw, unauthenticated —
-/// callers MUST `verify()` each event and treat contents as hostile until
-/// unwrapped successfully). Used against the invitee's inbox relay.
+/// Genuine NIP-59 gift wraps ([`KIND_NIP59_GIFT_WRAP`]) addressed to
+/// `recipient_hex` (raw, unauthenticated — callers MUST `verify()` each event
+/// and treat contents as hostile until unwrapped successfully). Used against
+/// the INVITEE'S INBOX RELAY, never a git node: this is the invite/promotion
+/// plane, so it keeps the NIP-59 kind and did NOT move with the stream wraps
+/// (see the two constants in `events.rs`).
 /// Until-paginated: a flooded recipient address cannot push genuine wraps out
 /// of the result window.
 pub fn giftwraps_for(relay_url: &str, recipient_hex: &str) -> Result<Vec<Event>> {
-    let filter = serde_json::json!({ "kinds": [1059], "#p": [recipient_hex] });
-    fetch_all(relay_url, filter)
+    fetch_all(relay_url, giftwrap_filter(recipient_hex))
 }
 
-/// Kind-1059 wraps authored by ANY of the given outer keys (derived
-/// stream/rekey address keys). NIP-01 `authors` is an array: the
+/// The REQ filter [`giftwraps_for`] issues. Split out so the invite plane's
+/// kind can be asserted against what `invite::wrap_invite` actually emits.
+pub fn giftwrap_filter(recipient_hex: &str) -> serde_json::Value {
+    serde_json::json!({ "kinds": [KIND_NIP59_GIFT_WRAP], "#p": [recipient_hex] })
+}
+
+/// CORD stream wraps ([`KIND_STREAM_WRAP`]) authored by ANY of the given outer
+/// keys (derived stream/rekey address keys). This is the READ side of every
+/// wrap `build_*` emit site — it MUST name the same kind they do, or joins and
+/// `#collab` threads come back EMPTY with no error at all (`roster`,
+/// `issue/pr list`, `show`). Keep it on the named constant.
+/// NIP-01 `authors` is an array: the
 /// `#collab`/guestbook read paths pass the current derived stream pubkey
 /// plus every retained prior one (GitLab #21 — pre-refounding wraps live
 /// under prior stream keys and would otherwise never be fetched at all).
@@ -187,8 +201,54 @@ pub fn giftwraps_for(relay_url: &str, recipient_hex: &str) -> Result<Vec<Event>>
 /// unparseable wraps, so junk only costs bandwidth (bounded by the tenant's
 /// storage quota on the server side).
 pub fn wraps_by_authors(relay_url: &str, author_hexes: &[String]) -> Result<Vec<Event>> {
-    let filter = serde_json::json!({ "kinds": [1059], "authors": author_hexes });
-    fetch_all(relay_url, filter)
+    fetch_all(relay_url, stream_wrap_filter(author_hexes))
+}
+
+/// The REQ filter [`wraps_by_authors`] issues. Split out so the emit sites can
+/// assert, in unit tests, that they publish the kind this asks for: a
+/// disagreement here is SILENT (empty reads, no error), so it is pinned rather
+/// than reviewed. EVERY stream-wrap read must build its filter here — including
+/// the ones that fetch through [`fetch_all_multi`] rather than
+/// [`wraps_by_authors`] (`repo::ensure_no_existing_rekeys`, `repo::fold`) —
+/// or it sits outside that pinning.
+///
+/// NO DUAL-KIND READ WINDOW (deliberate). This client reads ONLY
+/// [`KIND_STREAM_WRAP`], and nothing rewrites or aliases the kind of
+/// already-stored events, so stream wraps published at the pre-migration
+/// [`KIND_NIP59_GIFT_WRAP`] are invisible here — silently, as empty results
+/// (`repo::roster`, `repo::collab_threads`, `repo::fold`,
+/// `repo::ensure_no_existing_rekeys`). The server's
+/// `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND` does NOT cover this: it gates ingest
+/// and peer-sync only, never the REQs it serves to clients.
+///
+/// That was acceptable at migration time because the implementation had never
+/// been used for real: no production repo predated the migration, so there was
+/// no history to lose. (The only live private repo, `276a6003…` / alias
+/// `1fcf1c68…`, was a throwaway deployment canary.) Confirmed by the operator
+/// on 2026-07-28 — this is why the window was skipped, not an oversight.
+///
+/// If a read window is ever needed, widening this filter is NOT enough on its
+/// own — it would fetch the legacy wraps and then throw them away at the three
+/// parse-side kind checks (`collab::parse_collab_with_ring`,
+/// `invite::parse_join_with_ring`, `rekey::parse_rekey`). Relax the filter and
+/// all three TOGETHER, behind ONE shared predicate, so the accepted kind set
+/// has a single definition.
+pub fn stream_wrap_filter(author_hexes: &[String]) -> serde_json::Value {
+    serde_json::json!({ "kinds": [KIND_STREAM_WRAP], "authors": author_hexes })
+}
+
+/// The single kind named by [`stream_wrap_filter`], for emit-site assertions.
+#[cfg(test)]
+pub(crate) fn stream_wrap_filter_kind() -> u64 {
+    stream_wrap_filter(&[])["kinds"][0].as_u64().unwrap()
+}
+
+/// The single kind named by [`giftwrap_filter`], for emit-site assertions.
+/// Mirror of [`stream_wrap_filter_kind`] — the invite plane gets the same
+/// emit-kind == read-kind pinning as the stream plane.
+#[cfg(test)]
+pub(crate) fn giftwrap_filter_kind() -> u64 {
+    giftwrap_filter("")["kinds"][0].as_u64().unwrap()
 }
 
 /// Fetch one event by id (pinpoint — cannot be flooded out of a limit

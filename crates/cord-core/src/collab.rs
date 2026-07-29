@@ -3,14 +3,16 @@
 //!
 //! Wire model (three layers, outermost first):
 //!
-//! 1. **Outer wrap** — kind-1059, signed by the derived `#collab` stream key
+//! 1. **Outer wrap** — kind-3359 (the CORD stream wrap; see
+//!    `events::KIND_STREAM_WRAP` for why this is NOT NIP-59's 1059), signed
+//!    by the derived `#collab` stream key
 //!    (`Keystore::guestbook_keys`, registered in the 30640 `aux` set so the
 //!    content-blind node admits it). Its `created_at` is tweaked into the past
 //!    (NIP-59 metadata-privacy discipline); rendering uses the INNER timestamp.
 //! 2. **20013 seal** — realized as a symmetric AEAD envelope under the
 //!    `#collab`-derived seal key (`crypto::collab_seal_key`), fresh nonce each
 //!    time. The seal kind is 20013 (Concord's addressable seal) conceptually;
-//!    on the content-blind node it can only travel inside the admitted 1059
+//!    on the content-blind node it can only travel inside the admitted 3359
 //!    outer, so the seal here is the encryption layer, not a separate stored
 //!    event. Its bytes are the base64 content of the outer wrap.
 //! 3. **Inner rumor** — a LITERAL NIP-34/22/32 kind (1621 issue, 1111 comment,
@@ -40,7 +42,7 @@ use nostr::prelude::FinalizeEvent;
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::crypto;
-use crate::events::FUTURE_SLACK_SECS;
+use crate::events::{FUTURE_SLACK_SECS, KIND_STREAM_WRAP};
 use crate::keystore::{CollabRing, Keystore};
 
 /// NIP-34 issue.
@@ -59,8 +61,6 @@ pub const KIND_STATUS_CLOSED: u16 = 1632;
 pub const KIND_STATUS_DRAFT: u16 = 1633;
 /// Concord addressable seal kind (see module docs — realized as the AEAD layer).
 pub const KIND_SEAL: u16 = 20013;
-/// Admitted outer wrap kind.
-pub const KIND_WRAP: u16 = 1059;
 
 /// The mandated `channel` tag value for this data plane.
 const CHANNEL_COLLAB: &str = "collab";
@@ -121,7 +121,7 @@ impl Status {
 /// A built `#collab` message ready to publish: the outer wrap plus the verbatim
 /// inner-rumor bytes the caller must retain (flip-public byte-exact republish).
 pub struct CollabPublish {
-    /// Outer kind-1059 wrap (server-visible).
+    /// Outer kind-3359 stream wrap (server-visible).
     pub wrap: Event,
     /// Raw signed inner rumor JSON — retain on disk verbatim.
     pub raw: Vec<u8>,
@@ -166,9 +166,9 @@ fn seal_rumor(
     let sealed = crypto::seal_symmetric(&seal_key, &raw)?;
     let wrap_content = base64::engine::general_purpose::STANDARD.encode(sealed);
 
-    // Outer 1059: derived #collab stream key (aux-registered); past-tweaked ts.
+    // Outer 3359: derived #collab stream key (aux-registered); past-tweaked ts.
     let stream = ks.guestbook_keys()?;
-    let wrap = EventBuilder::new(Kind::Custom(KIND_WRAP), wrap_content)
+    let wrap = EventBuilder::new(Kind::Custom(KIND_STREAM_WRAP), wrap_content)
         .custom_created_at(Timestamp::tweaked(0..172_800))
         .finalize(&stream)?;
     Ok(CollabPublish {
@@ -311,8 +311,8 @@ fn parse_collab_with_ring(
 ) -> Result<CollabEvent> {
     wrap.verify()
         .map_err(|e| anyhow!("collab wrap has an invalid signature: {e}"))?;
-    if wrap.kind != Kind::Custom(KIND_WRAP) {
-        bail!("not a 1059 wrap");
+    if wrap.kind != Kind::Custom(KIND_STREAM_WRAP) {
+        bail!("{}", crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16()));
     }
     // Match the outer signer against the derived stream key of the CURRENT
     // #collab key first, then every retained prior key (GitLab #21: history
@@ -553,6 +553,22 @@ mod tests {
         }
     }
 
+    /// Emit/read kind agreement. A wrap published at a kind the REQ filter
+    /// does not name comes back EMPTY with NO error -- that is the whole
+    /// failure mode of the 1059 -> 3359 migration (silently empty `roster`,
+    /// `issue list`, `pr list`, `show`). Assert against the filter itself, so
+    /// moving one side without the other fails here instead of in production.
+    #[test]
+    fn collab_wrap_kind_matches_the_read_filter() {
+        let ks = owner_keystore();
+        let author = Keys::generate();
+        let pubbed = build_issue(&author, &ks, "s", "b").unwrap();
+        assert_eq!(
+            pubbed.wrap.kind.as_u16() as u64,
+            crate::relay::stream_wrap_filter_kind()
+        );
+    }
+
     #[test]
     fn issue_roundtrip_binds_and_retains_raw() {
         let ks = owner_keystore();
@@ -683,7 +699,7 @@ mod tests {
         let seal_key = crypto::collab_seal_key(&ks.collab_key_bytes().unwrap());
         let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
         let content_b64 = base64::engine::general_purpose::STANDARD.encode(sealed);
-        EventBuilder::new(Kind::Custom(KIND_WRAP), content_b64)
+        EventBuilder::new(Kind::Custom(KIND_STREAM_WRAP), content_b64)
             .custom_created_at(Timestamp::tweaked(0..172_800))
             .finalize(&ks.guestbook_keys().unwrap())
             .unwrap()
@@ -766,7 +782,7 @@ mod tests {
         let seal_key = crypto::collab_seal_key(&ks1.collab_key_bytes().unwrap());
         let sealed = crypto::seal_symmetric(&seal_key, &rumor.as_json().into_bytes()).unwrap();
         let mixed = EventBuilder::new(
-            Kind::Custom(KIND_WRAP),
+            Kind::Custom(KIND_STREAM_WRAP),
             base64::engine::general_purpose::STANDARD.encode(sealed),
         )
         .custom_created_at(Timestamp::tweaked(0..172_800))

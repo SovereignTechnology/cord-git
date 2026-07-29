@@ -790,7 +790,7 @@ fn main() -> Result<()> {
                     // parse_rekey rejects it at the content-decode step, which
                     // is precisely the unparseable-wrap skip path under test.
                     let builder = nostr::EventBuilder::new(
-                        nostr::Kind::Custom(rekey::KIND_WRAP),
+                        nostr::Kind::Custom(cord_core::events::KIND_STREAM_WRAP),
                         format!(
                             "junk-{}",
                             cord_core::crypto::sha256_hex(

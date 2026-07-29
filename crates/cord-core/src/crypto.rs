@@ -18,8 +18,8 @@ const WRITE_AUTH_LABEL: &[u8] = b"cord-git/write-auth/v1";
 const MANIFEST_LABEL: &[u8] = b"cord-git/manifest/v1";
 /// Domain-separation prefix for the self-certifying community id.
 const COMMUNITY_LABEL: &[u8] = b"cord-git/community/v1";
-/// HKDF label for the derived guestbook STREAM keypair (signs the outer 1059
-/// wrap of every guestbook Join — never the member npub). Derived from the
+/// HKDF label for the derived guestbook STREAM keypair (signs the outer
+/// kind-3359 wrap of every guestbook Join — never the member npub). Derived from the
 /// shared `#collab` key so every member computes the same keypair.
 const GUESTBOOK_STREAM_LABEL: &[u8] = b"cord-git/guestbook-stream/v1";
 /// HKDF label for the symmetric guestbook SEAL key (encrypts the Join rumor
