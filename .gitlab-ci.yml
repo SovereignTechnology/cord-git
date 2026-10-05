@@ -1,6 +1,7 @@
 # cord-git CI. Every job runs in a fresh Kata VM on ubuntu-server (Debian
 # bookworm, the image's Rust toolchain). Nothing is cached between jobs and
-# there are no CI/CD variables or secrets.
+# there are no CI/CD variables or secrets. The end-to-end job builds its own
+# git (see .server-git).
 #
 # Runners:
 #   ci-grasp       not protected: merge requests.
@@ -43,6 +44,35 @@ stages:
   - e2e
   - release
 
+# Git for the job that RUNS the server. ngit-grasp shells out to git and needs
+# 2.42 or newer since v3.0.6; the runner image has bookworm's 2.39.5 and Debian
+# has never backported git to bookworm. So the end-to-end job builds the version
+# Debian 13 ships from kernel.org's tarball, pinned by sha256, into /usr/local
+# (ahead of /usr/bin on PATH), exactly as sovtech/grasp-p's test job does. Keep
+# the two blocks identical. lint, test and release use the image's git: the
+# client only calls rev-list, pack-objects and unpack-objects.
+.server-git:
+  before_script:
+    - rustc --version && cargo --version
+    - |
+      git_v=2.47.3
+      git_sha=9c2eb1250781b3e5bfef098572d07fdf132d67e6c065e4307332ade9819a1501
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get -q -o Acquire::Retries=3 update
+      apt-get -q -y --no-install-recommends install libcurl4-gnutls-dev
+      b=$(mktemp -d)
+      curl -fsSL --retry 3 --max-time 300 -o "$b/git.tar.xz" "https://mirrors.edge.kernel.org/pub/software/scm/git/git-$git_v.tar.xz"
+      echo "$git_sha  $b/git.tar.xz" | sha256sum --strict --quiet -c -
+      tar -C "$b" -xJf "$b/git.tar.xz"
+      make -s -C "$b/git-$git_v" -j8 prefix=/usr/local CFLAGS=-O2 NO_GETTEXT=1 NO_TCLTK=1 NO_PERL=1 NO_PYTHON=1 NO_EXPAT=1 install > "$b/make.log" 2>&1 || { tail -n 60 "$b/make.log" >&2; exit 1; }
+      rm -rf "$b"; hash -r
+    # The server under test must find the git a production guest gives it.
+    - |
+      v=$(git --version); v=${v#git version }
+      [ "$(command -v git)" = /usr/local/bin/git ] || { echo "git on PATH is $(command -v git), not the one just built" >&2; exit 1; }
+      dpkg --compare-versions "$v" ge 2.42 || { echo "git $v: the server needs 2.42 or newer" >&2; exit 1; }
+      echo "git $v at /usr/local/bin/git"
+
 lint:
   stage: lint
   timeout: 30m
@@ -61,6 +91,7 @@ test:
 # sovtech/grasp-p, cloned with the job token (project 12 lists this project in
 # its job-token allowlist) and built here.
 e2e:
+  extends: .server-git
   stage: e2e
   needs: []
   timeout: 2h
