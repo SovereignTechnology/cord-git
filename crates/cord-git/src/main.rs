@@ -390,7 +390,10 @@ fn print_thread_summary(t: &cord_core::collab::Thread) {
 fn print_thread_full(t: &cord_core::collab::Thread) {
     let title = t.root.subject.as_deref().unwrap_or("(no subject)");
     println!("{} [{}]", title, t.status_label());
-    println!("root {}  by {}  at {}", t.root.id, t.root.author, t.root.created_at);
+    println!(
+        "root {}  by {}  at {}",
+        t.root.id, t.root.author, t.root.created_at
+    );
     if !t.root.content.is_empty() {
         println!("\n{}\n", t.root.content);
     }
@@ -558,7 +561,9 @@ fn main() -> Result<()> {
                 let threads = repo::collab_threads(&cid)?;
                 match threads.iter().find(|t| t.root.id == root_id) {
                     Some(t) => print_thread_full(t),
-                    None => anyhow::bail!("no readable thread {root_id} (wrong id, or before the last rekey)"),
+                    None => anyhow::bail!(
+                        "no readable thread {root_id} (wrong id, or before the last rekey)"
+                    ),
                 }
             }
             IssueCmd::Comment {
@@ -612,7 +617,9 @@ fn main() -> Result<()> {
                 let threads = repo::collab_threads(&cid)?;
                 match threads.iter().find(|t| t.root.id == root_id) {
                     Some(t) => print_thread_full(t),
-                    None => anyhow::bail!("no readable PR {root_id} (wrong id, or before the last rekey)"),
+                    None => anyhow::bail!(
+                        "no readable PR {root_id} (wrong id, or before the last rekey)"
+                    ),
                 }
             }
             PrCmd::Status {
@@ -624,7 +631,8 @@ fn main() -> Result<()> {
             } => {
                 let keys = nostr::Keys::parse(&nsec).context("invalid --nsec")?;
                 let status = cord_core::collab::Status::parse(&state)?;
-                let id = repo::pr_status(&dir, &keys, &root_id, status, note.as_deref().unwrap_or(""))?;
+                let id =
+                    repo::pr_status(&dir, &keys, &root_id, status, note.as_deref().unwrap_or(""))?;
                 println!("set PR {root_id} to {state} (status {id})");
             }
         },
@@ -657,12 +665,17 @@ fn main() -> Result<()> {
             let tags = ev.tags.clone();
             let at = nostr::Timestamp::from_secs(nostr::Timestamp::now().as_secs() + ahead_secs);
             ev = nostr::prelude::FinalizeEvent::finalize(
-                nostr::EventBuilder::new(nostr::Kind::Custom(30641), "").tags(tags).custom_created_at(at),
+                nostr::EventBuilder::new(nostr::Kind::Custom(30641), "")
+                    .tags(tags)
+                    .custom_created_at(at),
                 &wk,
             )?;
             let relay = ks.relays.first().context("no relay")?;
             let out = cord_core::relay::publish(relay, &ev)?;
-            println!("forged future-dated 30641: accepted={} msg={}", out.accepted, out.message);
+            println!(
+                "forged future-dated 30641: accepted={} msg={}",
+                out.accepted, out.message
+            );
         }
         Cmd::DebugReaderAttack { community_id } => {
             anyhow::ensure!(
@@ -855,7 +868,10 @@ fn main() -> Result<()> {
             let out = cord_core::relay::publish(relay, &wrap)?;
             println!("forked_write_rekey_admitted={}", out.accepted);
         }
-        Cmd::DebugSquatRekey { community_id, scope } => {
+        Cmd::DebugSquatRekey {
+            community_id,
+            scope,
+        } => {
             anyhow::ensure!(
                 std::env::var("CORD_GIT_ALLOW_DEBUG").as_deref() == Ok("1"),
                 "debug commands require CORD_GIT_ALLOW_DEBUG=1"
@@ -884,12 +900,11 @@ fn main() -> Result<()> {
             // accepted §3.2 residual).
             let addr = rekey::rekey_address(&root, &community_id, scope, next)?;
             let squatter = nostr::Keys::generate();
-            let squat_alias = cord_core::crypto::sha256_hex(
-                &nostr::Keys::generate().public_key().to_bytes(),
-            )[..32]
-                .to_string();
-            let backdated =
-                nostr::Timestamp::from_secs(nostr::Timestamp::now().as_secs() - 86_400);
+            let squat_alias =
+                cord_core::crypto::sha256_hex(&nostr::Keys::generate().public_key().to_bytes())
+                    [..32]
+                    .to_string();
+            let backdated = nostr::Timestamp::from_secs(nostr::Timestamp::now().as_secs() - 86_400);
             let throwaway = nostr::Keys::generate(); // throwaway write key
             let reg = cord_core::events::build_registration_keysets_at(
                 &squatter,
@@ -921,8 +936,12 @@ fn doctor(community_id: &str) -> Result<()> {
         let wk = ks.write_keys()?;
         let tenant = ks.tenant_hex()?;
         let sig = cord_core::crypto::key_pop_sig(&wk, &tenant, &ks.alias);
-        let ok = cord_core::crypto::verify_key_pop(&wk.public_key().to_hex(), &sig, &tenant, &ks.alias);
-        println!("write key + proof-of-possession: {}", if ok { "ok" } else { "FAILED" });
+        let ok =
+            cord_core::crypto::verify_key_pop(&wk.public_key().to_hex(), &sig, &tenant, &ks.alias);
+        println!(
+            "write key + proof-of-possession: {}",
+            if ok { "ok" } else { "FAILED" }
+        );
     }
     // Relay reachability + authenticated state-root selection.
     match cord_core::repo::latest_valid_state_root(&ks) {

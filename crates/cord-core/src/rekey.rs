@@ -408,7 +408,10 @@ pub fn parse_rekey(
     wrap.verify()
         .map_err(|e| anyhow!("rekey wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_STREAM_WRAP) {
-        bail!("{}", crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16()));
+        bail!(
+            "{}",
+            crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16())
+        );
     }
     let addr = rekey_address(prior_root, community_id_hex, scope, expect_epoch)?;
     if wrap.pubkey != addr.public_key() {
@@ -454,8 +457,8 @@ pub fn parse_rekey(
     // The epoch's expected scope set (GitLab !12): tenant-signed, so any
     // single genuine rekey is authoritative for which sibling rekeys the
     // epoch requires. Must be present, well-formed, and contain this scope.
-    let scopes_tag = tag("scopes")
-        .ok_or_else(|| anyhow!("rekey is missing its epoch scope-set tag"))?;
+    let scopes_tag =
+        tag("scopes").ok_or_else(|| anyhow!("rekey is missing its epoch scope-set tag"))?;
     let epoch_scopes = parse_scope_set(&scopes_tag)?;
     if !epoch_scopes.contains(&scope) {
         bail!("rekey scope-set tag does not list its own scope");
@@ -672,7 +675,13 @@ mod tests {
 
         // Retained member (holding the prior write secrets) applies it.
         let parsed = parse_rekey(
-            &wrap, &c, &tenant, &root, Scope::Write, 1, &member,
+            &wrap,
+            &c,
+            &tenant,
+            &root,
+            Scope::Write,
+            1,
+            &member,
             Some((&old_secret, 0)),
         )
         .unwrap();
@@ -682,27 +691,43 @@ mod tests {
         assert_eq!(slot.epoch, 1);
 
         // A member with NO slot sees the rekey but concludes demoted/never-had.
-        let parsed = parse_rekey(
-            &wrap, &c, &tenant, &root, Scope::Write, 1, &outsider, None,
-        )
-        .unwrap();
+        let parsed =
+            parse_rekey(&wrap, &c, &tenant, &root, Scope::Write, 1, &outsider, None).unwrap();
         assert!(parsed.slot.is_none());
 
         // Wrong prior secrets → prevcommit mismatch → rejected.
         assert!(parse_rekey(
-            &wrap, &c, &tenant, &root, Scope::Write, 1, &member,
+            &wrap,
+            &c,
+            &tenant,
+            &root,
+            Scope::Write,
+            1,
+            &member,
             Some((&[0u8; 32], 0)),
         )
         .is_err());
         // Wrong expected epoch → address/epoch mismatch → rejected.
         assert!(parse_rekey(
-            &wrap, &c, &tenant, &root, Scope::Write, 2, &member,
+            &wrap,
+            &c,
+            &tenant,
+            &root,
+            Scope::Write,
+            2,
+            &member,
             Some((&old_secret, 0)),
         )
         .is_err());
         // Wrong root (post-roll member) cannot even locate/open it.
         assert!(parse_rekey(
-            &wrap, &c, &tenant, &[0u8; 32], Scope::Write, 1, &member,
+            &wrap,
+            &c,
+            &tenant,
+            &[0u8; 32],
+            Scope::Write,
+            1,
+            &member,
             Some((&old_secret, 0)),
         )
         .is_err());
@@ -733,7 +758,11 @@ mod tests {
         .unwrap();
         // Forger signs the inner rumor with their own key.
         let (forged, _raw) = build_rekey(
-            &forger, &c, &root, Scope::State, 1,
+            &forger,
+            &c,
+            &root,
+            Scope::State,
+            1,
             &[(victim.public_key(), payload.clone())],
             None,
             &Scope::all(),
@@ -743,7 +772,11 @@ mod tests {
 
         // The genuine tenant-signed one passes.
         let (real, _raw) = build_rekey(
-            &hosting, &c, &root, Scope::State, 1,
+            &hosting,
+            &c,
+            &root,
+            Scope::State,
+            1,
             &[(victim.public_key(), payload)],
             None,
             &Scope::all(),
@@ -768,7 +801,11 @@ mod tests {
         })
         .unwrap();
         let (wrap, _raw) = build_rekey(
-            &hosting, &cid(), &root, Scope::Collab, 1,
+            &hosting,
+            &cid(),
+            &root,
+            Scope::Collab,
+            1,
             &[(member.public_key(), payload)],
             None,
             &Scope::all(),
@@ -777,7 +814,14 @@ mod tests {
         // Same wrap presented under another community id: the derived address
         // and scope id both diverge → rejected (cross-repo replay).
         assert!(parse_rekey(
-            &wrap, &"cd".repeat(32), &tenant, &root, Scope::Collab, 1, &member, None
+            &wrap,
+            &"cd".repeat(32),
+            &tenant,
+            &root,
+            Scope::Collab,
+            1,
+            &member,
+            None
         )
         .is_err());
     }
@@ -787,10 +831,17 @@ mod tests {
         let hosting = Keys::generate();
         let root = [7u8; 32];
         // Write scope without prevcommit refused.
-        assert!(
-            build_rekey(&hosting, &cid(), &root, Scope::Write, 1, &[], None, &[Scope::Write])
-                .is_err()
-        );
+        assert!(build_rekey(
+            &hosting,
+            &cid(),
+            &root,
+            Scope::Write,
+            1,
+            &[],
+            None,
+            &[Scope::Write]
+        )
+        .is_err());
         // Channel scope with prevcommit refused.
         let pc = write_scope_prevcommit(&[1u8; 32], 0);
         assert!(build_rekey(
@@ -838,11 +889,14 @@ mod tests {
             &root,
             Scope::Write,
             1,
-            &[(member.public_key(), serde_json::to_vec(&WriteSlot {
-                write_secret: hex::encode([6u8; 32]),
-                epoch: 1,
-            })
-            .unwrap())],
+            &[(
+                member.public_key(),
+                serde_json::to_vec(&WriteSlot {
+                    write_secret: hex::encode([6u8; 32]),
+                    epoch: 1,
+                })
+                .unwrap(),
+            )],
             Some(&pc),
             &[Scope::Write],
         )
@@ -871,8 +925,17 @@ mod tests {
             &[Scope::Write, Scope::Collab, Scope::State], // order normalized
         )
         .unwrap();
-        let parsed =
-            parse_rekey(&c_wrap, &cid(), &tenant, &root, Scope::Collab, 1, &member, None).unwrap();
+        let parsed = parse_rekey(
+            &c_wrap,
+            &cid(),
+            &tenant,
+            &root,
+            Scope::Collab,
+            1,
+            &member,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             parsed.epoch_scopes,
             vec![Scope::State, Scope::Collab, Scope::Write]
@@ -886,9 +949,11 @@ mod tests {
             retired_at: 1_700_000_000,
         };
         // Pre-ring payload shape (GitLab #21): no prior_collab_keys field.
-        let old: CollabSlot =
-            serde_json::from_str(&format!(r#"{{"collab_key":"{}","epoch":3}}"#, "aa".repeat(32)))
-                .unwrap();
+        let old: CollabSlot = serde_json::from_str(&format!(
+            r#"{{"collab_key":"{}","epoch":3}}"#,
+            "aa".repeat(32)
+        ))
+        .unwrap();
         assert!(old.prior_collab_keys.is_empty());
         old.validate().unwrap();
 
@@ -911,7 +976,7 @@ mod tests {
         assert!(parse_scope_set("state,state").is_err()); // dup
         assert!(parse_scope_set("state,root").is_err()); // unknown name
         assert!(parse_scope_set(" state").is_err()); // whitespace
-        // Rendering is canonical (sorted, deduped).
+                                                     // Rendering is canonical (sorted, deduped).
         assert_eq!(
             render_scope_set(&[Scope::Write, Scope::State]),
             "state,write"

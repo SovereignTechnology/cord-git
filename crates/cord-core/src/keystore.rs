@@ -258,13 +258,13 @@ impl Keystore {
         }
         if self.retain_collab_history {
             let outgoing = std::mem::replace(&mut self.collab_key, new_key);
-            let entry = self
-                .prior_collab_keys
-                .entry(self.epoch)
-                .or_insert_with(|| PriorCollabKey {
-                    key: outgoing.clone(),
-                    retired_at: crate::events::now_secs(),
-                });
+            let entry =
+                self.prior_collab_keys
+                    .entry(self.epoch)
+                    .or_insert_with(|| PriorCollabKey {
+                        key: outgoing.clone(),
+                        retired_at: crate::events::now_secs(),
+                    });
             if entry.key != outgoing {
                 entry.key = outgoing;
                 entry.retired_at = crate::events::now_secs();

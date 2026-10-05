@@ -179,7 +179,12 @@ fn seal_rumor(
 }
 
 /// Build a new issue (thread root).
-pub fn build_issue(author: &Keys, ks: &Keystore, subject: &str, body: &str) -> Result<CollabPublish> {
+pub fn build_issue(
+    author: &Keys,
+    ks: &Keystore,
+    subject: &str,
+    body: &str,
+) -> Result<CollabPublish> {
     if subject.trim().is_empty() {
         bail!("issue subject must not be empty");
     }
@@ -199,13 +204,19 @@ pub fn build_comment(
     if !is_event_id(root_id) {
         bail!("invalid root id (expected 64 lowercase hex)");
     }
-    let mut extra = vec![Tag::custom("e", vec![root_id.to_string(), String::new(), "root".to_string()])];
+    let mut extra = vec![Tag::custom(
+        "e",
+        vec![root_id.to_string(), String::new(), "root".to_string()],
+    )];
     if let Some(p) = parent_id {
         if p != root_id {
             if !is_event_id(p) {
                 bail!("invalid reply id (expected 64 lowercase hex)");
             }
-            extra.push(Tag::custom("e", vec![p.to_string(), String::new(), "reply".to_string()]));
+            extra.push(Tag::custom(
+                "e",
+                vec![p.to_string(), String::new(), "reply".to_string()],
+            ));
         }
     }
     seal_rumor(author, ks, KIND_COMMENT, body, extra)
@@ -222,7 +233,10 @@ pub fn build_status(
     if !is_event_id(root_id) {
         bail!("invalid target id (expected 64 lowercase hex)");
     }
-    let extra = vec![Tag::custom("e", vec![root_id.to_string(), String::new(), "root".to_string()])];
+    let extra = vec![Tag::custom(
+        "e",
+        vec![root_id.to_string(), String::new(), "root".to_string()],
+    )];
     seal_rumor(author, ks, status.kind(), note, extra)
 }
 
@@ -312,7 +326,10 @@ fn parse_collab_with_ring(
     wrap.verify()
         .map_err(|e| anyhow!("collab wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_STREAM_WRAP) {
-        bail!("{}", crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16()));
+        bail!(
+            "{}",
+            crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16())
+        );
     }
     // Match the outer signer against the derived stream key of the CURRENT
     // #collab key first, then every retained prior key (GitLab #21: history
@@ -390,7 +407,10 @@ fn parse_collab_with_ring(
             // seal key above fails to decrypt). A tag claiming a FUTURE epoch is
             // a cross-epoch replay/forgery signal and is rejected.
             "epoch" if v.len() >= 2 => {
-                epoch_ok = v[1].parse::<u32>().map(|e| e <= epoch_bound).unwrap_or(false);
+                epoch_ok = v[1]
+                    .parse::<u32>()
+                    .map(|e| e <= epoch_bound)
+                    .unwrap_or(false);
             }
             "subject" if v.len() >= 2 && subject.is_none() => subject = Some(v[1].clone()),
             "e" if v.len() >= 2 => {
@@ -439,9 +459,7 @@ pub struct Thread {
 impl Thread {
     /// Convenience: the latest status as a human label, or "open" by default.
     pub fn status_label(&self) -> &'static str {
-        self.latest_status
-            .and_then(Status::label)
-            .unwrap_or("open")
+        self.latest_status.and_then(Status::label).unwrap_or("open")
     }
 }
 
@@ -577,7 +595,10 @@ mod tests {
 
         // Outer signer is the derived stream key, never the author npub; no
         // plaintext leaks onto the wire.
-        assert_eq!(pubbed.wrap.pubkey, ks.guestbook_keys().unwrap().public_key());
+        assert_eq!(
+            pubbed.wrap.pubkey,
+            ks.guestbook_keys().unwrap().public_key()
+        );
         assert_ne!(pubbed.wrap.pubkey, author.public_key());
         assert!(!pubbed.wrap.as_json().contains("fix the bug"));
         assert!(!pubbed.wrap.as_json().contains(&ks.community_id));
@@ -657,7 +678,10 @@ mod tests {
         assert_eq!(t.children.len(), 3);
         assert_eq!(t.status_label(), "closed");
         // The reply marker was captured on the second comment.
-        assert!(t.children.iter().any(|c| c.reply.as_deref() == Some(c1_id.as_str())));
+        assert!(t
+            .children
+            .iter()
+            .any(|c| c.reply.as_deref() == Some(c1_id.as_str())));
     }
 
     #[test]
@@ -713,15 +737,36 @@ mod tests {
         let extra = vec![Tag::custom("subject", vec!["s".to_string()])];
 
         // Inside the slack window: accepted (clock skew must not break members).
-        let ok = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra.clone(), now + FUTURE_SLACK_SECS - 60);
+        let ok = seal_rumor_dated(
+            &author,
+            &ks,
+            KIND_ISSUE,
+            "b",
+            extra.clone(),
+            now + FUTURE_SLACK_SECS - 60,
+        );
         assert!(parse_collab_at(&ks, &ok, now).is_ok());
 
         // Just past the slack window: rejected.
-        let over = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra.clone(), now + FUTURE_SLACK_SECS + 60);
+        let over = seal_rumor_dated(
+            &author,
+            &ks,
+            KIND_ISSUE,
+            "b",
+            extra.clone(),
+            now + FUTURE_SLACK_SECS + 60,
+        );
         assert!(parse_collab_at(&ks, &over, now).is_err());
 
         // The issue-15/16 attack shape: created_at = now + 10 years.
-        let far = seal_rumor_dated(&author, &ks, KIND_ISSUE, "b", extra, now + 10 * 365 * 86_400);
+        let far = seal_rumor_dated(
+            &author,
+            &ks,
+            KIND_ISSUE,
+            "b",
+            extra,
+            now + 10 * 365 * 86_400,
+        );
         let err = parse_collab_at(&ks, &far, now).unwrap_err().to_string();
         assert!(err.contains("future-dated"), "unexpected error: {err}");
     }
@@ -809,8 +854,14 @@ mod tests {
         let extra = vec![Tag::custom("subject", vec!["s".to_string()])];
         // Content from while the key was current: history, stays readable
         // arbitrarily far in the future.
-        let old_ok =
-            seal_rumor_dated(&author, &ks0, KIND_ISSUE, "b", extra.clone(), retired_at - 10);
+        let old_ok = seal_rumor_dated(
+            &author,
+            &ks0,
+            KIND_ISSUE,
+            "b",
+            extra.clone(),
+            retired_at - 10,
+        );
         assert!(parse_collab_at(&ks1, &old_ok, now + 30 * 86_400).is_ok());
 
         // Post-retirement injection under the old key: rejected even long
@@ -827,8 +878,7 @@ mod tests {
         // signal, not history.
         let mut ks_lie = ks0.clone();
         ks_lie.epoch = 1; // binding_tags stamps epoch 1, seals under key 0
-        let epoch_lie =
-            seal_rumor_dated(&author, &ks_lie, KIND_ISSUE, "b", extra, retired_at - 10);
+        let epoch_lie = seal_rumor_dated(&author, &ks_lie, KIND_ISSUE, "b", extra, retired_at - 10);
         assert!(parse_collab_at(&ks1, &epoch_lie, now).is_err());
     }
 
@@ -845,7 +895,15 @@ mod tests {
         let root_id = issue.rumor_id.clone();
         let honest = build_status(&owner, &ks, &root_id, Status::Open, "open").unwrap();
 
-        let e_tag = Tag::custom("e", vec![root_id.clone(), String::new(), String::new(), "root".to_string()]);
+        let e_tag = Tag::custom(
+            "e",
+            vec![
+                root_id.clone(),
+                String::new(),
+                String::new(),
+                "root".to_string(),
+            ],
+        );
         let forged = seal_rumor_dated(
             &reader,
             &ks,

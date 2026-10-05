@@ -144,7 +144,9 @@ pub fn fetch(relay_url: &str, filter: serde_json::Value) -> Result<Vec<Event>> {
             }
         }
     }
-    let _ = ws.send(Message::Text(serde_json::json!(["CLOSE", sub]).to_string().into()));
+    let _ = ws.send(Message::Text(
+        serde_json::json!(["CLOSE", sub]).to_string().into(),
+    ));
     let _ = ws.close(None);
     if !got_eose {
         return Err(anyhow!("no EOSE from relay within deadline"));
@@ -265,10 +267,7 @@ pub fn event_by_id(relay_url: &str, id_hex: &str) -> Result<Vec<Event>> {
 /// rekeys/registrations from a member who has another node configured
 /// (GitLab !12/!13): any single answering relay suffices. Errors only when
 /// EVERY relay failed — one dead relay must never brick a fold (verify F3).
-pub fn fetch_all_multi(
-    relay_urls: &[String],
-    filter: serde_json::Value,
-) -> Result<Vec<Event>> {
+pub fn fetch_all_multi(relay_urls: &[String], filter: serde_json::Value) -> Result<Vec<Event>> {
     let mut out: Vec<Event> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut errors = Vec::new();

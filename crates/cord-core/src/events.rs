@@ -143,10 +143,7 @@ pub fn build_registration_keysets_at(
     }
     for aux in aux_keys {
         let aux_pop = crypto::key_pop_sig(aux, &tenant_hex, alias);
-        tags.push(Tag::custom(
-            "aux",
-            vec![aux.public_key().to_hex(), aux_pop],
-        ));
+        tags.push(Tag::custom("aux", vec![aux.public_key().to_hex(), aux_pop]));
     }
     tags.push(Tag::custom("relays", relays.to_vec()));
     tags.push(Tag::custom("server", servers.to_vec()));
@@ -216,10 +213,7 @@ pub fn build_blossom_auth(
     let tags = vec![
         Tag::custom("t", vec![op.tag_value().to_string()]),
         Tag::custom("x", vec![sha256_hex.to_string()]),
-        Tag::custom(
-            "expiration",
-            vec![expiration.to_string()],
-        ),
+        Tag::custom("expiration", vec![expiration.to_string()]),
         Tag::custom("a", vec![coord]),
     ];
     let event = EventBuilder::new(Kind::Custom(24242), "")
@@ -264,7 +258,10 @@ mod wrap_kind_tests {
     fn legacy_wrap_kind_is_explained_not_just_rejected() {
         let legacy = unexpected_stream_wrap_kind(KIND_NIP59_GIFT_WRAP);
         assert!(legacy.contains("legacy"), "{legacy}");
-        assert!(legacy.contains("1059") && legacy.contains("3359"), "{legacy}");
+        assert!(
+            legacy.contains("1059") && legacy.contains("3359"),
+            "{legacy}"
+        );
         assert!(legacy.contains("no longer reads it"), "{legacy}");
 
         // Any other unexpected kind keeps the generic wording — the legacy

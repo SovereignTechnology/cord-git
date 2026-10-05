@@ -258,7 +258,12 @@ mod tests {
             &alias
         ));
         // Wrong alias must not verify (binding to tenant/alias).
-        assert!(!verify_key_pop(&wk.public_key().to_hex(), &sig, &tenant, "cc"));
+        assert!(!verify_key_pop(
+            &wk.public_key().to_hex(),
+            &sig,
+            &tenant,
+            "cc"
+        ));
     }
 
     #[test]

@@ -105,14 +105,13 @@ impl InviteBundle {
     /// Build the bundle for one grant from the inviter's keystore.
     /// `write_secret` is included IFF the granted role is `write`.
     pub fn from_keystore(ks: &Keystore, role: Role) -> Result<Self> {
-        let write_secret = match role {
-            Role::Write => Some(
-                ks.write_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("cannot grant write: this keystore has no write_secret"))?,
-            ),
-            Role::Read => None,
-        };
+        let write_secret =
+            match role {
+                Role::Write => Some(ks.write_secret.clone().ok_or_else(|| {
+                    anyhow!("cannot grant write: this keystore has no write_secret")
+                })?),
+                Role::Read => None,
+            };
         Ok(Self {
             v: 1,
             typ: BUNDLE_TYPE.to_string(),
@@ -165,7 +164,8 @@ impl InviteBundle {
         if !is_hex_exact(&self.cord_git.alias, 32) {
             bail!("invalid alias in invite");
         }
-        if !is_hex_exact(&self.cord_git.state_key, 64) || !is_hex_exact(&self.cord_git.collab_key, 64)
+        if !is_hex_exact(&self.cord_git.state_key, 64)
+            || !is_hex_exact(&self.cord_git.collab_key, 64)
         {
             bail!("invalid channel keys in invite");
         }
@@ -237,8 +237,8 @@ pub fn wrap_invite(bundle: &InviteBundle, invitee: &PublicKey) -> Result<Event> 
     bundle.validate()?;
     let eph = Keys::generate();
     let content = serde_json::to_string(bundle)?;
-    let mut rumor = EventBuilder::new(Kind::Custom(KIND_INVITE), content)
-        .finalize_unsigned(eph.public_key());
+    let mut rumor =
+        EventBuilder::new(Kind::Custom(KIND_INVITE), content).finalize_unsigned(eph.public_key());
     rumor.ensure_id();
     GiftWrapBuilder::new(*invitee, rumor)
         .finalize(&eph)
@@ -328,8 +328,8 @@ pub fn wrap_promotion(ks: &Keystore, member: &PublicKey) -> Result<(Event, Promo
     bundle.validate()?;
     let eph = Keys::generate();
     let content = serde_json::to_string(&bundle)?;
-    let mut rumor = EventBuilder::new(Kind::Custom(KIND_INVITE), content)
-        .finalize_unsigned(eph.public_key());
+    let mut rumor =
+        EventBuilder::new(Kind::Custom(KIND_INVITE), content).finalize_unsigned(eph.public_key());
     rumor.ensure_id();
     let wrap = GiftWrapBuilder::new(*member, rumor)
         .finalize(&eph)
@@ -420,14 +420,19 @@ fn parse_join_with_ring(
     wrap.verify()
         .map_err(|e| anyhow!("guestbook wrap has an invalid signature: {e}"))?;
     if wrap.kind != Kind::Custom(KIND_STREAM_WRAP) {
-        bail!("{}", crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16()));
+        bail!(
+            "{}",
+            crate::events::unexpected_stream_wrap_kind(wrap.kind.as_u16())
+        );
     }
     // Ring match, exactly as parse_collab (GitLab #21): the current #collab
     // key's derived stream key first, then retained priors — join history
     // survives refoundings. The matched ring entry selects the seal key too
     // (stream + seal derive from the same collab key; no cross-epoch mixing).
     let Some(entry) = ring.match_author(&wrap.pubkey) else {
-        bail!("wrap outer signer is not a derived guestbook stream key (current or retained prior)");
+        bail!(
+            "wrap outer signer is not a derived guestbook stream key (current or retained prior)"
+        );
     };
     let sealed = base64::engine::general_purpose::STANDARD
         .decode(wrap.content.as_bytes())
@@ -440,7 +445,10 @@ fn parse_join_with_ring(
         .verify()
         .map_err(|e| anyhow!("inner join rumor has an invalid signature: {e}"))?;
     if inner.kind != Kind::Custom(KIND_JOIN) {
-        bail!("sealed rumor is not a guestbook join (kind {})", inner.kind.as_u16());
+        bail!(
+            "sealed rumor is not a guestbook join (kind {})",
+            inner.kind.as_u16()
+        );
     }
     // Same future-dating bound as #collab rumors and the 30640/30641 editions:
     // `JoinInfo.at` is a join-order signal, so an unbounded created_at lets a
@@ -545,7 +553,10 @@ mod tests {
         // The member keystore never gets the hosting nsec.
         let mks = got.into_keystore();
         assert!(mks.hosting_nsec.is_none());
-        assert_eq!(mks.tenant_pub.as_deref(), Some(ks.tenant_hex().unwrap().as_str()));
+        assert_eq!(
+            mks.tenant_pub.as_deref(),
+            Some(ks.tenant_hex().unwrap().as_str())
+        );
         assert!(mks.is_write());
     }
 
@@ -785,11 +796,15 @@ mod tests {
 
         // Malformed prior key hex is refused.
         let mut bad = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
-        bad.cord_git.prior_collab_keys.insert(0, prior(&"zz".repeat(32)));
+        bad.cord_git
+            .prior_collab_keys
+            .insert(0, prior(&"zz".repeat(32)));
         assert!(bad.validate().is_err());
         // A "prior" entry at/after the bundle epoch is refused.
         let mut bad = InviteBundle::from_keystore(&ks, Role::Read).unwrap();
-        bad.cord_git.prior_collab_keys.insert(2, prior(&"bb".repeat(32)));
+        bad.cord_git
+            .prior_collab_keys
+            .insert(2, prior(&"bb".repeat(32)));
         assert!(bad.validate().is_err());
     }
 
@@ -817,6 +832,8 @@ mod tests {
             .collect();
         assert_eq!(aux.len(), 1);
         assert_eq!(aux[0][1], gb.public_key().to_hex());
-        assert!(crypto::verify_key_pop(&aux[0][1], &aux[0][2], &tenant, &alias));
+        assert!(crypto::verify_key_pop(
+            &aux[0][1], &aux[0][2], &tenant, &alias
+        ));
     }
 }

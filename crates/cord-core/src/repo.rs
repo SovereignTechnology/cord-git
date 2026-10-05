@@ -143,12 +143,7 @@ fn hosting_key_from_env() -> Result<nostr::Keys> {
 
 /// `cord-git create` — generate all secrets, register (30640), persist the
 /// keystore, and drop a `.cord-git` pointer in `repo_dir`.
-pub fn create(
-    repo_dir: &Path,
-    name: &str,
-    node_relay: &str,
-    node_server: &str,
-) -> Result<Created> {
+pub fn create(repo_dir: &Path, name: &str, node_relay: &str, node_server: &str) -> Result<Created> {
     let hosting = hosting_key_from_env()?;
     let salt = crypto::random_32();
     let community_id = crypto::community_id(&hosting.public_key(), &salt);
@@ -285,8 +280,8 @@ pub fn invite(
         );
     }
 
-    let invitee_pk = nostr::PublicKey::parse(invitee)
-        .map_err(|e| anyhow!("invalid invitee npub: {e}"))?;
+    let invitee_pk =
+        nostr::PublicKey::parse(invitee).map_err(|e| anyhow!("invalid invitee npub: {e}"))?;
     let invitee_hex = invitee_pk.to_hex();
 
     // Record the Grant in the roster (upsert by npub), then snapshot it into
@@ -446,10 +441,7 @@ fn publish_collab(ks: &Keystore, pubbed: &CollabPublish) -> Result<String> {
     // byte-exact JSON; re-serialization would break the id/signature).
     let dir = Keystore::community_dir(&ks.community_id)?.join("collab");
     std::fs::create_dir_all(&dir)?;
-    crate::keystore::write_0600(
-        &dir.join(format!("{}.json", pubbed.rumor_id)),
-        &pubbed.raw,
-    )?;
+    crate::keystore::write_0600(&dir.join(format!("{}.json", pubbed.rumor_id)), &pubbed.raw)?;
 
     let out = relay::publish(relay_url, &pubbed.wrap)?;
     if !out.accepted {
@@ -514,12 +506,7 @@ pub fn issue_close(
 /// `cord-git pr new` — build a patch series from a git revision range
 /// (`git format-patch`), publish each patch as a 1617 rumor threaded under the
 /// first, and return the PR root id.
-pub fn pr_new(
-    repo_dir: &Path,
-    author: &nostr::Keys,
-    range: &str,
-    subject: &str,
-) -> Result<String> {
+pub fn pr_new(repo_dir: &Path, author: &nostr::Keys, range: &str, subject: &str) -> Result<String> {
     let ks = load_collab_ks(repo_dir)?;
     let patches = git::format_patch_range(repo_dir, range)?;
     if patches.is_empty() {
@@ -572,7 +559,11 @@ pub fn push(repo_dir: &Path, force: bool) -> Result<String> {
         bail!("this repo is read-only for you (no write_secret)");
     }
     let relay_url = ks.relays.first().context("no relay configured")?.clone();
-    let server_url = ks.servers.first().context("no blob server configured")?.clone();
+    let server_url = ks
+        .servers
+        .first()
+        .context("no blob server configured")?
+        .clone();
     let tenant_hex = ks.tenant_hex()?;
     let write_keys = ks.write_keys()?;
     let state_key = ks.state_key_bytes()?;
@@ -616,8 +607,13 @@ pub fn push(repo_dir: &Path, force: bool) -> Result<String> {
     let menc = crypto::encrypt_manifest(&state_key, &manifest.to_json())?;
 
     // Upload both blobs (24242-authed).
-    let (_e, pack_auth) =
-        events::build_blossom_auth(&write_keys, BlobOp::Upload, &enc.blob_id, &tenant_hex, &ks.alias)?;
+    let (_e, pack_auth) = events::build_blossom_auth(
+        &write_keys,
+        BlobOp::Upload,
+        &enc.blob_id,
+        &tenant_hex,
+        &ks.alias,
+    )?;
     blob::put(&server_url, &enc.wire, &pack_auth)?;
     let (_e, man_auth) = events::build_blossom_auth(
         &write_keys,
@@ -976,8 +972,8 @@ fn rebuild_registration(
     created_at: u64,
 ) -> Result<nostr::Event> {
     use nostr::prelude::FinalizeEvent;
-    let template =
-        nostr::Event::from_json(template_json).context("pending registration template is not an event")?;
+    let template = nostr::Event::from_json(template_json)
+        .context("pending registration template is not an event")?;
     template
         .verify()
         .map_err(|e| anyhow!("pending registration template fails signature verification: {e}"))?;
@@ -1076,7 +1072,8 @@ fn publish_widen_variant_on(
                  {relay_url} (squatted or stale) — publishing the widen without the rekey \
                  addresses; the rekey wraps are admitted under the squatter's registration"
             );
-            let minimal = rebuild_registration(template_json, rekey_addr_pubs, hosting, created_at)?;
+            let minimal =
+                rebuild_registration(template_json, rekey_addr_pubs, hosting, created_at)?;
             publish_registration_confirmed_on(relay_url, ks, &minimal).with_context(|| {
                 format!(
                     "30640-prime (minimal widen) was not accepted on {relay_url} — \
@@ -1155,9 +1152,9 @@ fn run_pending_rotation(repo_dir: &Path, ks: &Keystore, p: &PendingEpoch) -> Res
         {
             continue; // rotation fully landed here already
         }
-        let is_ours = live.as_ref().is_some_and(|l| {
-            registration_is_widen_variant(l, &widen_template, &rekey_addr_pubs)
-        });
+        let is_ours = live
+            .as_ref()
+            .is_some_and(|l| registration_is_widen_variant(l, &widen_template, &rekey_addr_pubs));
         if !is_ours {
             if let Some(l) = &live {
                 if l.created_at.as_secs() > widen_template.created_at.as_secs() {
@@ -1174,14 +1171,7 @@ fn run_pending_rotation(repo_dir: &Path, ks: &Keystore, p: &PendingEpoch) -> Res
                 .as_ref()
                 .map(|l| l.created_at.as_secs() + 1)
                 .unwrap_or_else(now_secs);
-            publish_widen_variant_on(
-                relay_url,
-                ks,
-                &p.widen_json,
-                &rekey_addr_pubs,
-                &hosting,
-                at,
-            )?;
+            publish_widen_variant_on(relay_url, ks, &p.widen_json, &rekey_addr_pubs, &hosting, at)?;
         }
         widen_live_relays.push(relay_url.clone());
     }
@@ -1199,34 +1189,42 @@ fn run_pending_rotation(repo_dir: &Path, ks: &Keystore, p: &PendingEpoch) -> Res
         let mut added: Vec<String> = Vec::new();
         let mut squatted: Vec<String> = Vec::new();
         for (scope, wrap, raw) in &rekeys {
-            publish_rekey_wrap(wrap, raw, std::slice::from_ref(relay_url), &ks.community_id, |missing_addr| {
-                if squatted.iter().any(|a| a == missing_addr) {
-                    return Ok(());
-                }
-                added.push(missing_addr.to_string());
-                let live_now = live_registration_on(relay_url, ks)?;
-                let at = live_now
-                    .as_ref()
-                    .map(|l| l.created_at.as_secs() + 1)
-                    .unwrap_or_else(now_secs);
-                let drop: Vec<String> = rekey_addr_pubs
-                    .iter()
-                    .filter(|a| !added.contains(a))
-                    .cloned()
-                    .collect();
-                let widened = rebuild_registration(&p.widen_json, &drop, &hosting, at)?;
-                match publish_registration_confirmed_on(relay_url, ks, &widened) {
-                    Ok(()) => Ok(()),
-                    Err(e) if format!("{e:#}").contains("write key already registered") => {
-                        added.retain(|a| a != missing_addr);
-                        squatted.push(missing_addr.to_string());
-                        Ok(())
+            publish_rekey_wrap(
+                wrap,
+                raw,
+                std::slice::from_ref(relay_url),
+                &ks.community_id,
+                |missing_addr| {
+                    if squatted.iter().any(|a| a == missing_addr) {
+                        return Ok(());
                     }
-                    Err(e) => Err(e).with_context(|| {
-                        format!("on-demand widen (adding a rekey address) failed on {relay_url}")
-                    }),
-                }
-            })?;
+                    added.push(missing_addr.to_string());
+                    let live_now = live_registration_on(relay_url, ks)?;
+                    let at = live_now
+                        .as_ref()
+                        .map(|l| l.created_at.as_secs() + 1)
+                        .unwrap_or_else(now_secs);
+                    let drop: Vec<String> = rekey_addr_pubs
+                        .iter()
+                        .filter(|a| !added.contains(a))
+                        .cloned()
+                        .collect();
+                    let widened = rebuild_registration(&p.widen_json, &drop, &hosting, at)?;
+                    match publish_registration_confirmed_on(relay_url, ks, &widened) {
+                        Ok(()) => Ok(()),
+                        Err(e) if format!("{e:#}").contains("write key already registered") => {
+                            added.retain(|a| a != missing_addr);
+                            squatted.push(missing_addr.to_string());
+                            Ok(())
+                        }
+                        Err(e) => Err(e).with_context(|| {
+                            format!(
+                                "on-demand widen (adding a rekey address) failed on {relay_url}"
+                            )
+                        }),
+                    }
+                },
+            )?;
             debug_abort_point(&format!("rekey:{scope}"))?;
         }
         let live_now = live_registration_on(relay_url, ks)?;
@@ -1322,9 +1320,8 @@ fn pending_gate(ks: &Keystore, kind: &str, target: &str) -> Result<PendingGate> 
             nostr::Event::from_json(&p.narrow_json).context("pending narrow is not an event")?;
         let mut landed_everywhere = true;
         for relay_url in &ks.relays {
-            let live = live_registration_on(relay_url, ks).with_context(|| {
-                format!("cannot read the live registration from {relay_url}")
-            })?;
+            let live = live_registration_on(relay_url, ks)
+                .with_context(|| format!("cannot read the live registration from {relay_url}"))?;
             if !live
                 .as_ref()
                 .is_some_and(|l| registration_key_sets_match(l, &narrow_template))
@@ -1465,8 +1462,8 @@ pub fn revoke(repo_dir: &Path, banned_npub: &str) -> Result<String> {
         bail!("owner keystore is missing the write secret");
     }
     let hosting = ks.hosting_keys()?;
-    let banned_pk = nostr::PublicKey::parse(banned_npub)
-        .map_err(|e| anyhow!("invalid npub to revoke: {e}"))?;
+    let banned_pk =
+        nostr::PublicKey::parse(banned_npub).map_err(|e| anyhow!("invalid npub to revoke: {e}"))?;
     let banned_hex = banned_pk.to_hex();
     if banned_hex == ks.tenant_hex()? {
         bail!("refusing to revoke the owner identity");
@@ -1833,10 +1830,7 @@ pub fn demote(repo_dir: &Path, npub: &str) -> Result<String> {
         rekeys: vec![PendingRekey {
             scope: Scope::Write.name().to_string(),
             wrap_json: write_wrap.as_json(),
-            raw_b64: base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &write_raw,
-            ),
+            raw_b64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &write_raw),
         }],
     };
     save_pending(&pending, &community_id)?;
@@ -2020,7 +2014,9 @@ fn plan_epoch(genuine: &[(Scope, &rekey::ParsedRekey)]) -> EpochPlan {
     let mut conclusions: Vec<(Scope, Option<Vec<u8>>)> = Vec::new();
     for scope in Scope::all() {
         let mut per_scope = genuine.iter().filter(|(s, _)| *s == scope).map(|(_, p)| *p);
-        let Some(first) = per_scope.next() else { continue };
+        let Some(first) = per_scope.next() else {
+            continue;
+        };
         for other in per_scope {
             if other.slot != first.slot {
                 return EpochPlan::Fork(format!(
@@ -2161,7 +2157,11 @@ pub fn fold(community_id: &str, member_keys: &nostr::Keys) -> Result<u32> {
                         .iter()
                         .find(|e| e.npub == me)
                         .map(|e| e.role)
-                        .unwrap_or(if is_owner_self { Role::Write } else { Role::Read });
+                        .unwrap_or(if is_owner_self {
+                            Role::Write
+                        } else {
+                            Role::Read
+                        });
                 }
                 Scope::Collab => {
                     let Some(bytes) = slot else {
@@ -2284,7 +2284,11 @@ fn registration_matches_ks(ks: &Keystore, live: &nostr::Event) -> Result<()> {
 pub fn clone(community_id: &str, dest: &Path) -> Result<()> {
     let mut ks = Keystore::load(community_id)
         .with_context(|| format!("no keystore for {community_id}; join or create first"))?;
-    let server_url = ks.servers.first().context("no blob server configured")?.clone();
+    let server_url = ks
+        .servers
+        .first()
+        .context("no blob server configured")?
+        .clone();
     let state_key = ks.state_key_bytes()?;
 
     // Refuse to clone into a non-empty directory: unpacking into an existing
@@ -2314,7 +2318,10 @@ pub fn clone(community_id: &str, dest: &Path) -> Result<()> {
     for pe in &manifest.packs {
         let wire = blob::get(&server_url, &pe.blob_id)?;
         if crypto::sha256_hex(&wire) != pe.blob_id {
-            bail!("pack blob {} hash mismatch — operator served wrong bytes", pe.blob_id);
+            bail!(
+                "pack blob {} hash mismatch — operator served wrong bytes",
+                pe.blob_id
+            );
         }
         let key = hex32(&pe.key)?;
         let pack = crypto::decrypt_blob(&key, &wire)?;
@@ -2390,8 +2397,9 @@ fn write_pointer(repo_dir: &Path, community_id: &str) -> Result<()> {
 
 fn read_pointer(repo_dir: &Path) -> Result<String> {
     let p = repo_dir.join(POINTER_FILE);
-    let s = std::fs::read_to_string(&p)
-        .with_context(|| format!("no {POINTER_FILE} in {repo_dir:?}; run `cord-git create` here"))?;
+    let s = std::fs::read_to_string(&p).with_context(|| {
+        format!("no {POINTER_FILE} in {repo_dir:?}; run `cord-git create` here")
+    })?;
     Ok(s.trim().to_string())
 }
 
@@ -2501,11 +2509,19 @@ mod tests {
         let w = Keys::generate();
         let alias = "cd".repeat(16);
         let reg = reg_for(&tenant, &w, &alias);
-        assert!(registration_is_valid(&reg, &tenant.public_key().to_hex(), now));
+        assert!(registration_is_valid(
+            &reg,
+            &tenant.public_key().to_hex(),
+            now
+        ));
         // Wrong tenant (operator injecting a forged registration).
         let other = Keys::generate();
         let forged = reg_for(&other, &w, &alias);
-        assert!(!registration_is_valid(&forged, &tenant.public_key().to_hex(), now));
+        assert!(!registration_is_valid(
+            &forged,
+            &tenant.public_key().to_hex(),
+            now
+        ));
         // W keys parse out.
         let keys = parse_w_keys(&reg);
         assert_eq!(keys, vec![w.public_key().to_hex()]);
@@ -2602,10 +2618,7 @@ mod tests {
         // Same for any other single-scope or two-scope subset.
         let write = rk(Scope::Write, &Scope::all(), Some(b"w".to_vec()));
         let genuine = [(Scope::Write, &write)];
-        assert!(matches!(
-            plan_epoch(&genuine),
-            EpochPlan::Incomplete { .. }
-        ));
+        assert!(matches!(plan_epoch(&genuine), EpochPlan::Incomplete { .. }));
     }
 
     #[test]
@@ -2769,7 +2782,10 @@ mod tests {
         };
 
         // No pending file → None.
-        assert!(matches!(pending_gate(&ks, "revoke", &"ee".repeat(32)).unwrap(), PendingGate::None));
+        assert!(matches!(
+            pending_gate(&ks, "revoke", &"ee".repeat(32)).unwrap(),
+            PendingGate::None
+        ));
 
         // Corrupt pending file → loud error, never a guess.
         std::fs::write(pending_path(&cid).unwrap(), b"not json").unwrap();
@@ -2822,7 +2838,8 @@ mod tests {
         )
         .unwrap();
         // Full rebuild: same tags, new created_at, valid signature.
-        let rebuilt = rebuild_registration(&template.as_json(), &[], &tenant, 1_700_000_000).unwrap();
+        let rebuilt =
+            rebuild_registration(&template.as_json(), &[], &tenant, 1_700_000_000).unwrap();
         rebuilt.verify().unwrap();
         assert_eq!(rebuilt.created_at.as_secs(), 1_700_000_000);
         assert!(registration_key_sets_match(&rebuilt, &template));

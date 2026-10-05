@@ -68,9 +68,7 @@ fn main() {
                                 let mut matched: Vec<Value> = {
                                     let s = store.lock().unwrap();
                                     s.iter()
-                                        .filter(|ev| {
-                                            filters.iter().any(|f| matches_filter(ev, f))
-                                        })
+                                        .filter(|ev| filters.iter().any(|f| matches_filter(ev, f)))
                                         .cloned()
                                         .collect()
                                 };
@@ -112,7 +110,9 @@ fn main() {
 /// Minimal NIP-01 filter matching: ids, authors, kinds, #<single-letter>,
 /// since, until. Prefix matching for ids/authors is not needed by the e2e.
 fn matches_filter(ev: &Value, f: &Value) -> bool {
-    let Some(obj) = f.as_object() else { return false };
+    let Some(obj) = f.as_object() else {
+        return false;
+    };
     for (k, v) in obj {
         match k.as_str() {
             "ids" => {
