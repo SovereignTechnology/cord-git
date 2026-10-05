@@ -70,6 +70,15 @@ fail() { echo "FAIL: $1"; FAILED=1; }
 
 echo "=== workdir: $WORK ==="
 
+# Git identity for the commits this script makes: its own global config. A run
+# then neither depends on the caller's ~/.gitconfig (a CI VM has none, and
+# every commit in a repository without its own identity fails there, mostly
+# with stderr discarded) nor is changed by it (signing, hooks, templates).
+# The per-repository identities set below still win.
+export GIT_CONFIG_GLOBAL="$WORK/gitconfig"
+git config --global user.name e2e
+git config --global user.email e2e@example.com
+
 # --- spawn server -----------------------------------------------------------
 # Run from inside the data dir so the server's CWD-relative .relay-owner.nsec
 # lands in the throwaway workdir (cleaned up), never the repo.
