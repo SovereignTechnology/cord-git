@@ -1,29 +1,95 @@
-# cord-git — CORD-git client for GRASP-P private repos
+# cord-git: client for GRASP-P private repositories
 
-Client for GitHub-style **private** git repositories hosted on public
-Nostr/GRASP nodes running the GRASP-P server extension, where the operator is
-untrusted (content-blind): packs and manifests are AEAD-encrypted client-side,
-membership/keys/invites are tenant-side.
+Private git repositories on a public Nostr/GRASP server whose operator is not
+trusted. This client encrypts packs and manifests before upload and manages
+keys, membership and invites itself; the server only ever stores ciphertext
+and opaque public keys.
 
-- `cord-core` — library: crypto, keystore, manifest, events, relay/blob/git.
-- `cord-git` — CLI: `create`, `push`, `clone`, `status`, `doctor`.
+For how the whole system fits together, read the server repo's
+`docs/grasp-p/OVERVIEW.md`. The full convention is `docs/grasp-p/CORD-git-v0-spec.md`.
 
-## Quick start (against a local GRASP-P node)
+**Status: working prototype, not yet a product.** See [Known gaps](#known-gaps).
+
+## Crates
+
+| Crate | What it is |
+|---|---|
+| `cord-core` | Library: crypto, keystore, manifest, events, relay, blob and git plumbing |
+| `cord-git` | The CLI |
+| `inbox-relay` | A minimal relay used by the end-to-end tests |
+
+## Quick start
+
+Against a GRASP-P node (whitelist-mode nodes need a hosting key the operator has
+admitted, supplied in `CORD_GIT_HOSTING_NSEC`):
 
 ```
-cord-git create demo --relay ws://NODE:PORT --server http://NODE:PORT   # in a git repo
-cord-git push                                                            # publish
-cord-git clone <community_id> ./somewhere                                # elsewhere
+cord-git create demo --relay wss://NODE --server https://NODE   # in a git repo
+cord-git push                                                    # encrypt and publish
+cord-git clone <community_id> ./somewhere                        # with a keystore for it
 ```
 
-Secrets live under `CORD_GIT_HOME` (default `~/.config/cord-git`), 0600.
+Adding a collaborator:
 
-## Status
+```
+cord-git invite <npub> --write --via wss://THEIR-INBOX-RELAY     # owner
+cord-git join --relay wss://THEIR-INBOX-RELAY                    # invitee
+cord-git clone <community_id> ./repo                             # invitee
+```
 
-Phase 3 (see `../ref/ngit-grasp/docs/grasp-p/phase3-*.md`): create/push/clone +
-client-side CAS, proven end-to-end against a live server (`scripts/e2e.sh`).
-Invite/join/revoke and the `git-remote-cord` helper are Phase 4. The
-membership/crypto layer is CORD-git-native; Concord byte-conformance is deferred.
+Removing one:
+
+```
+cord-git revoke <npub>            # owner: rotate secrets, lock them out
+cord-git fold <community_id>      # every remaining member: pick up the new keys
+```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `create NAME --relay --server` | Register a new private repo and link the directory |
+| `push [--force]` | Pack, encrypt, upload and publish the current state |
+| `clone COMMUNITY_ID DIR` | Clone a repo you hold a keystore for |
+| `invite NPUB [--write] --via RELAY` | Deliver an invite to the invitee's own inbox relay |
+| `join --relay RELAY` or `--file F` | Consume an invite and publish a guestbook entry |
+| `revoke NPUB` | Ban a member and refound the repo's secrets |
+| `demote NPUB` | Writer to reader, without a full refounding |
+| `promote NPUB --via RELAY` / `promote-accept` | Grant and accept the write role |
+| `rotate` | Roll the write secret and state key |
+| `fold COMMUNITY_ID` | Apply pending rotations to your keystore |
+| `issue new\|list\|show\|comment\|close` | Encrypted issues |
+| `pr new\|list\|show\|status` | Encrypted patch series |
+| `roster`, `status`, `doctor` | Inspect members, the keystore and connectivity |
+| `keygen` | Generate a Nostr identity |
+
+Invites and promotions are never sent to a git node; the client refuses.
+
+## Keys and storage
+
+- Keystore: `$CORD_GIT_HOME` or `~/.config/cord-git/<community_id>/keystore.json`,
+  mode 0600 in a 0700 directory.
+- Your member key is read from `CORD_GIT_NSEC` (or `--nsec`). Prefer the
+  environment variable: an argument is visible to other processes.
+- The hosting key comes from `CORD_GIT_HOSTING_NSEC`, otherwise a fresh one is generated.
+
+## Tests
+
+`cargo test` runs the `cord-core` unit tests. `scripts/e2e.sh` runs the full
+scenario suite against a GRASP-P server binary (`SERVER_BIN`, `CORD_BIN`,
+`INBOX_BIN`; ports 7361-7363).
+
+## Known gaps
+
+Tracked as issues; none of these are fixed yet.
+
+- No `fetch` or `pull` into an existing clone, and no `git` remote helper.
+- Every push uploads the full history as a single pack.
+- The keystore is plaintext on disk; there is no remote-signer (NIP-46) support.
+- A hostile operator can serve an older, validly signed state.
+- Invite bundles do not prove who sent them.
+- A failed rotation can leave a revoked key registered until it is retried.
+- Only `refs/heads` are synced (no tags).
 
 ## History across revocations (GitLab #21)
 
