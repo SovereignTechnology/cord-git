@@ -7,3 +7,7 @@ when the client must follow a server change.
 
 It currently points at `legacy/v1.2-grasp-p`, the last server line before the
 port onto upstream ngit-grasp v3.
+
+On `main` and on release tags the end-to-end job refuses a `SERVER_REF` that is not on
+`main` or `legacy/v1.2-grasp-p` of sovtech/grasp-p. Review a `SERVER_REF` bump as server code:
+the job builds and runs that commit.

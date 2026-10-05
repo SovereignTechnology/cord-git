@@ -70,6 +70,14 @@ e2e:
     - git clone -q "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/gitlab/sovtech/grasp-p.git" /tmp/grasp-p
     - git -C /tmp/grasp-p -c advice.detachedHead=false checkout -q "$ref"
     - test "$(git -C /tmp/grasp-p rev-parse HEAD)" = "$ref"
+    # On protected refs this job runs beside the protected runner's token, so the server
+    # commit it builds must itself be on a protected branch of sovtech/grasp-p.
+    - |
+      if [ "$CI_COMMIT_REF_PROTECTED" = "true" ]; then
+        branches=$(git -C /tmp/grasp-p branch -r --contains "$ref")
+        grep -qxE ' *origin/(main|legacy/v1\.2-grasp-p)' <<<"$branches" ||
+          { echo "ci/SERVER_REF $ref is on no protected branch of sovtech/grasp-p" >&2; exit 1; }
+      fi
     - (cd /tmp/grasp-p && cargo build --release --locked --bin ngit-grasp)
     - cargo build --release --locked
     - export SERVER_BIN=/tmp/grasp-p/target/release/ngit-grasp
@@ -87,7 +95,8 @@ release:
     - mkdir -p ci-out
     - cp target/release/cord-git ci-out/
     - (cd ci-out && sha256sum cord-git > SHA256SUMS && cat SHA256SUMS)
-    - ldd --version | head -n1 > ci-out/BUILD-INFO
+    # Not "ldd --version | head -n1": under pipefail ldd dies of SIGPIPE at random.
+    - echo "glibc $(getconf GNU_LIBC_VERSION)" > ci-out/BUILD-INFO
     - rustc --version >> ci-out/BUILD-INFO
     - git rev-parse HEAD >> ci-out/BUILD-INFO
   artifacts:
