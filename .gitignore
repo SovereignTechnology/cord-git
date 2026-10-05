@@ -5,3 +5,12 @@
 .relay-owner.nsec
 # client keystores if ever placed here
 .config/
+
+# Key material and local state that tests and tools write. Never commit these.
+*.nsec
+keystore*.json
+pending-epoch.json
+.env
+.env.*
+*.pem
+*.key

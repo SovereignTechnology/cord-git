@@ -21,6 +21,8 @@ convention `CORD-git-v0-spec.md`. Read those before changing protocol behaviour 
 - Commit subjects start with `sovtech:`. Never squash, never rebase or amend a pushed commit;
   fix forward. Never push to `main`; work on a branch.
 - Run `git status` immediately before every `git commit`.
+- Stage files by path. Never `git add -A` or `git add .`: the end-to-end script and the CLI write
+  key files and keystores into working directories.
 - **Never commit or print secrets.** No nsec, keystore, token or password in files, logs, test
   output or commit messages. Test keys are generated at run time or are obvious throwaway
   constants inside test code. Never add a code path that takes a secret key on the command line.
