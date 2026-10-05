@@ -1,5 +1,5 @@
 //! Construction of the three server-visible event kinds, matching the GRASP-P
-//! server contract exactly (see server `src/private/{registration,state_root,
+//! server contract exactly (see server `src/grasp_p/{registration,state_root,
 //! blossom_auth}.rs`).
 
 use anyhow::Result;
@@ -31,10 +31,12 @@ pub const FUTURE_SLACK_SECS: u64 = 900;
 /// 1059 would oblige relays to violate NIP-59 in order to serve us, so the
 /// stream plane carries its own kind.
 ///
-/// Server counterpart: `ngit-grasp` `src/private/mod.rs::KIND_STREAM_WRAP`.
-/// The server dual-accepts the legacy 1059 while
-/// `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND` is on (its default), so clients may
-/// emit 3359 immediately; the flag is what eventually retires 1059.
+/// Server counterpart: `ngit-grasp` `src/grasp_p/mod.rs::KIND_STREAM_WRAP`.
+/// The server also has `NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND` (on by default)
+/// for the legacy kind 1059, but since the port onto ngit-grasp v3 its relay
+/// refuses a 1059 without exactly one `p` tag before that setting is
+/// consulted, so the tagless stream wraps this client used to emit are no
+/// longer accepted. Only 3359 works.
 ///
 /// The ephemeral sibling is 23359 (legacy 21059). This client emits no
 /// ephemeral wraps at all, so it has no constant for it.
@@ -235,7 +237,7 @@ mod wrap_kind_tests {
     use super::*;
 
     /// The wire values, pinned as literals. These are a protocol contract with
-    /// the GRASP-P server (`private/mod.rs`), not an implementation detail:
+    /// the GRASP-P server (`grasp_p/mod.rs`), not an implementation detail:
     /// changing either one silently desynchronises client and node.
     #[test]
     fn wrap_kinds_are_the_wire_values() {

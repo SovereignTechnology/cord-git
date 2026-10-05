@@ -218,7 +218,7 @@ pub fn wraps_by_authors(relay_url: &str, author_hexes: &[String]) -> Result<Vec<
 /// [`KIND_NIP59_GIFT_WRAP`] are invisible here — silently, as empty results
 /// (`repo::roster`, `repo::collab_threads`, `repo::fold`,
 /// `repo::ensure_no_existing_rekeys`). The server's
-/// `NGIT_PRIVATE_ACCEPT_LEGACY_WRAP_KIND` does NOT cover this: it gates ingest
+/// `NGIT_GRASP_P_ACCEPT_LEGACY_WRAP_KIND` does NOT cover this: it gates ingest
 /// and peer-sync only, never the REQs it serves to clients.
 ///
 /// That was acceptable at migration time because the implementation had never

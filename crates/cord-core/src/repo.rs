@@ -276,7 +276,7 @@ pub fn invite(
 
     // NORMATIVE leak-management rule: the invite must ride the invitee's own
     // inbox relay, never a git node (the node refuses them anyway:
-    // NGIT_PRIVATE_ACCEPT_DIRECT_INVITES=false).
+    // NGIT_GRASP_P_ACCEPT_DIRECT_INVITES=false).
     let via_norm = normalize_relay_url(via_relay);
     if ks.relays.iter().any(|r| normalize_relay_url(r) == via_norm) {
         bail!(
