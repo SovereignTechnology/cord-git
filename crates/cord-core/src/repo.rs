@@ -270,8 +270,8 @@ pub fn invite(
     let role = if write { Role::Write } else { Role::Read };
 
     // NORMATIVE leak-management rule: the invite must ride the invitee's own
-    // inbox relay, never a git node (the node refuses them anyway:
-    // NGIT_GRASP_P_ACCEPT_DIRECT_INVITES=false).
+    // inbox relay, never a git node. Nothing on the node enforces this, so
+    // the refusal below is the only guard.
     let via_norm = normalize_relay_url(via_relay);
     if ks.relays.iter().any(|r| normalize_relay_url(r) == via_norm) {
         bail!(

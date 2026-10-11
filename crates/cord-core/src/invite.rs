@@ -9,8 +9,8 @@
 //! - The invite bundle carries everything a member needs (community id, node
 //!   coordinates, channel keys, `write_secret` IFF push role) inside a
 //!   kind-3313 rumor, gift-wrapped FROM AN EPHEMERAL SIGNER and delivered to
-//!   the invitee's OWN inbox relay — NORMATIVE: never to the git nodes
-//!   (`NGIT_GRASP_P_ACCEPT_DIRECT_INVITES=false` stays false server-side).
+//!   the invitee's OWN inbox relay — NORMATIVE: never to the git nodes.
+//!   The server has no setting for this; the rule is enforced here only.
 //! - The guestbook Join is published only AFTER the joiner holds the bundle;
 //!   its OUTER 3359 is signed by the derived guestbook stream key (registered
 //!   in the 30640 `aux` set), never the member npub. The inner Join rumor is a
