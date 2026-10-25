@@ -40,6 +40,7 @@ convention `CORD-git-v0-spec.md`. Read those before changing protocol behaviour 
 
 ## Out of scope for a cloud session
 
-Deployment, the GitLab project, CI runners and anything on SovTech hosts. GitLab is the canonical
-remote and GitHub is a working mirror: push branches here, and they are carried to GitLab from
-the maintainer's machine.
+Deployment, the GitLab project, CI runners and anything on SovTech hosts. The canonical repository
+is on Nostr (`nostr://npub1s0vtech…/git.sovit.xyz/cord-git`, the `origin` remote on the
+maintainer's machine); GitLab (`gitlab`) runs CI and GitHub is a public read-only mirror. Push
+branches here, and they are carried to the other remotes from the maintainer's machine.

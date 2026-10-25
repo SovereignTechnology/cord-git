@@ -1,14 +1,38 @@
 # cord-git: client for GRASP-P private repositories
 
+> **Experimental, work in progress.** cord-git is an early prototype of
+> SovTech's GRASP-P private-repository convention (CORD-git v0). It has not
+> been independently security-audited, the wire format and keystore layout may
+> change incompatibly without notice, and there is no stability or support
+> guarantee. Do not rely on it for anything you cannot afford to lose or leak.
+
+## What this is
+
 Private git repositories on a public Nostr/GRASP server whose operator is not
 trusted. This client encrypts packs and manifests before upload and manages
 keys, membership and invites itself; the server only ever stores ciphertext
 and opaque public keys.
 
+GRASP-P has two halves:
+
+| Part | Repo | Role |
+|---|---|---|
+| **GRASP-P** | `grasp-p` (not yet public) | Server extension to [ngit-grasp](https://gitworkshop.dev/danconwaydev.com/grasp) |
+| **CORD-git** | this one | Client: keys, encryption, membership, invites |
+
 For how the whole system fits together, read the server repo's
 `docs/grasp-p/OVERVIEW.md`. The full convention is `docs/grasp-p/CORD-git-v0-spec.md`.
 
-**Status: working prototype, not yet a product.** See [Known gaps](#known-gaps).
+**Status: experimental prototype, not yet a product.** See [Known gaps](#known-gaps).
+
+## Where it lives
+
+- Canonical repository, on Nostr (clone with [ngit](https://ngit.dev)):
+  `nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/cord-git`
+- GitHub: [SovereignTechnology/cord-git](https://github.com/SovereignTechnology/cord-git), a read-only mirror.
+  Send patches and pull requests over Nostr with ngit.
+
+Licensed under the [MIT licence](LICENSE).
 
 ## Crates
 
