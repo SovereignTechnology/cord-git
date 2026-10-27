@@ -17,11 +17,12 @@ GRASP-P has two halves:
 
 | Part | Repo | Role |
 |---|---|---|
-| **GRASP-P** | `grasp-p` (not yet public) | Server extension to [ngit-grasp](https://gitworkshop.dev/danconwaydev.com/grasp) |
+| **GRASP-P** | [grasp-p](https://github.com/SovereignTechnology/grasp-p) | Server extension to [ngit-grasp](https://gitworkshop.dev/danconwaydev.com/grasp) |
 | **CORD-git** | this one | Client: keys, encryption, membership, invites |
 
 For how the whole system fits together, read the server repo's
-`docs/grasp-p/OVERVIEW.md`. The full convention is `docs/grasp-p/CORD-git-v0-spec.md`.
+[`docs/grasp-p/OVERVIEW.md`](https://github.com/SovereignTechnology/grasp-p/blob/main/docs/grasp-p/OVERVIEW.md).
+The full convention is [`docs/grasp-p/CORD-git-v0-spec.md`](https://github.com/SovereignTechnology/grasp-p/blob/main/docs/grasp-p/CORD-git-v0-spec.md).
 
 **Status: experimental prototype, not yet a product.** See [Known gaps](#known-gaps).
 
