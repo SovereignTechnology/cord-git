@@ -5,7 +5,7 @@ and tests against. It is a full SHA, never a branch name, so a server change
 cannot alter what a client pipeline proves. Bump it in its own merge request
 when the client must follow a server change.
 
-It points at a commit on `main` of sovtech/grasp-p: GRASP-P on upstream ngit-grasp v3.0.7,
+It points at a commit on `main` of sovtech/grasp-p: GRASP-P on upstream ngit-grasp v3.0.8,
 where the server's settings are `NGIT_GRASP_P_*` (`scripts/e2e.sh` uses those names). That
 server needs git 2.42 or newer at run time, which is why the end-to-end job builds its own.
 
